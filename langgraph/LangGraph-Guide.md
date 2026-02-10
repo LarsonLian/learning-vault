@@ -287,3 +287,419 @@ graph.invoke(None, config=config)  # 从中断点继续
 LangGraph 不是银弹,它解决的是**复杂 Agent 工作流的可控编排**问题。理解它的适用场景,可以帮助你在合适的时候选择合适的工具,避免过度设计或功能不足。
 
 ---
+
+### 第 2 章:核心抽象
+
+LangGraph 的设计围绕四个核心抽象展开:StateGraph(状态图)、State(状态)、Node(节点)和 Edge(边)。理解这四个概念之间的关系,是掌握 LangGraph 的关键。
+
+#### 2.1 StateGraph:有状态的有向图
+
+**概念**
+
+StateGraph 是 LangGraph 的顶层抽象,代表一个**有向图**(Directed Graph),图中的每个节点都可以读取和更新共享的状态。
+
+```
+StateGraph = 图结构 + 状态管理
+
+图结构: 定义节点和边的连接关系
+状态管理: 自动在节点间传递和更新状态
+```
+
+**与普通有向图的区别**
+
+| 特性 | 普通有向图 | StateGraph |
+|------|----------|------------|
+| **数据传递** | 通过边传递参数 | 通过共享状态传递 |
+| **节点输入** | 前置节点的输出 | 当前完整状态 |
+| **节点输出** | 传递给后续节点 | 状态更新(部分或全部字段) |
+| **历史追踪** | 通常不保留 | 自动保存每个状态版本 |
+
+**简单示例:三节点图**
+
+```python
+# 伪代码示例
+# 定义状态结构
+class State(TypedDict):
+  user_input: str
+  processed_data: str
+  final_output: str
+
+# 创建StateGraph
+graph_builder = StateGraph(State)
+
+# 添加三个节点
+graph_builder.add_node("collect", collect_input)
+graph_builder.add_node("process", process_data)
+graph_builder.add_node("respond", generate_response)
+
+# 添加边,定义执行顺序
+graph_builder.add_edge(START, "collect")
+graph_builder.add_edge("collect", "process")
+graph_builder.add_edge("process", "respond")
+graph_builder.add_edge("respond", END)
+
+# 编译成可执行的图
+graph = graph_builder.compile()
+```
+
+执行流程:
+
+```
+START → collect(读取State,更新user_input) →
+        process(读取user_input,更新processed_data) →
+        respond(读取processed_data,更新final_output) →
+        END
+```
+
+关键点:
+- 每个节点都能访问完整的 State
+- 节点只需返回要更新的字段,不需要返回整个状态
+- StateGraph 负责合并更新到当前状态
+
+#### 2.2 State:Agent 的记忆结构
+
+**概念**
+
+State 是在节点间流转的数据结构,代表 Agent 的**完整记忆**。它通常用 TypedDict 定义,明确每个字段的类型。
+
+```python
+# 伪代码
+class AgentState(TypedDict):
+  messages: list[Message]      # 对话历史
+  current_task: str             # 当前任务描述
+  task_status: str              # 任务状态
+  tools_used: list[str]         # 已使用的工具
+  iteration_count: int          # 迭代次数
+```
+
+**状态更新策略**
+
+LangGraph 提供三种状态更新策略:
+
+**1. 覆盖模式(Override)** - 默认行为
+
+```python
+# 默认情况下,新值覆盖旧值
+class State(TypedDict):
+  counter: int
+  status: str
+
+# 节点返回 {"counter": 5}
+# State中的counter字段被直接替换为5
+```
+
+**2. 累加模式(Add)** - 使用 Annotated + reducer
+
+```python
+# 使用operator.add作为reducer
+from typing import Annotated
+from operator import add
+
+class State(TypedDict):
+  items: Annotated[list, add]  # 列表累加
+
+# 初始 state = {"items": [1, 2]}
+# 节点返回 {"items": [3, 4]}
+# 结果 state = {"items": [1, 2, 3, 4]}  # 自动合并
+```
+
+**3. 自定义 reducer** - 完全自定义合并逻辑
+
+```python
+# 伪代码
+def custom_merge_messages(existing: list, new: list) -> list:
+  """自定义消息合并:去重 + 限制数量"""
+  all_messages = existing + new
+  # 去重(基于消息ID)
+  unique = deduplicate_by_id(all_messages)
+  # 只保留最近100条
+  return unique[-100:]
+
+class State(TypedDict):
+  messages: Annotated[list[Message], custom_merge_messages]
+```
+
+**内置 reducer:add_messages**
+
+LangGraph 为对话场景提供了专用的 `add_messages` reducer:
+
+```python
+from langgraph.graph.message import add_messages
+
+class State(TypedDict):
+  messages: Annotated[list[Message], add_messages]
+
+# add_messages 的特殊能力:
+# 1. 自动将字典转换为Message对象
+# 2. 根据消息ID更新已有消息(而不是追加)
+# 3. 正确处理tool_calls和tool_results
+```
+
+**状态访问模式**
+
+节点函数的输入是只读的状态副本:
+
+```python
+def my_node(state: State) -> dict:
+  # state 是当前状态的快照
+  # 读取状态
+  current_count = state["counter"]
+
+  # 不要直接修改 state!
+  # state["counter"] += 1  # ❌ 错误!
+
+  # 返回更新
+  return {"counter": current_count + 1}  # ✅ 正确
+```
+
+#### 2.3 Node:执行单元
+
+**概念**
+
+Node(节点)是图中的执行单元,本质上是一个**函数**,负责执行具体的任务。
+
+**节点函数签名**
+
+```python
+def node_function(state: StateType) -> dict | StateType:
+  """
+  输入: 当前完整状态
+  输出: 状态更新(字典)
+  """
+  # 1. 读取状态中需要的信息
+  user_input = state["user_input"]
+
+  # 2. 执行任务(LLM调用、工具执行、数据处理等)
+  result = do_something(user_input)
+
+  # 3. 返回状态更新
+  return {"processed_result": result}
+```
+
+**节点的典型实现模式**
+
+**模式1:LLM 调用节点**
+
+```python
+def llm_node(state: State) -> dict:
+  """调用LLM生成响应"""
+  messages = state["messages"]
+  response = llm.invoke(messages)
+  return {"messages": [response]}  # 追加到消息列表
+```
+
+**模式2:工具执行节点**
+
+```python
+def tool_node(state: State) -> dict:
+  """执行工具调用"""
+  tool_call = state["pending_tool_call"]
+  tool_result = execute_tool(tool_call.name, tool_call.args)
+  return {
+    "tool_results": [tool_result],
+    "pending_tool_call": None
+  }
+```
+
+**模式3:决策节点**
+
+```python
+def decision_node(state: State) -> dict:
+  """分析并做出决策"""
+  complexity = analyze_complexity(state["task"])
+  return {
+    "task_complexity": complexity,
+    "route_decision": "complex" if complexity > 0.7 else "simple"
+  }
+```
+
+**模式4:聚合节点**
+
+```python
+def aggregator_node(state: State) -> dict:
+  """聚合并行任务的结果"""
+  results = state["parallel_results"]
+  summary = combine_results(results)
+  return {"final_summary": summary}
+```
+
+**节点的关键特性**
+
+1. **无状态**: 节点函数本身不保存状态,所有上下文来自输入的 state
+2. **幂等性**: 同样的输入应该产生同样的输出(LLM调用除外)
+3. **单一职责**: 每个节点只做一件事,保持简单
+4. **可测试**: 易于单独测试,只需构造 state 输入
+
+#### 2.4 Edge:连接规则
+
+Edge(边)定义节点之间的连接关系,决定执行流程。LangGraph 支持两种边:
+
+**1. 普通边(Normal Edge)** - 固定的连接
+
+```python
+# 伪代码
+graph_builder.add_edge("node_a", "node_b")
+# 表示:node_a执行完后,总是执行node_b
+```
+
+执行流程确定:
+
+```
+node_a → node_b → node_c
+```
+
+**2. 条件边(Conditional Edge)** - 动态的路由
+
+```python
+# 伪代码
+def router_function(state: State) -> str:
+  """根据状态决定下一个节点"""
+  if state["confidence"] > 0.9:
+    return "high_confidence_handler"
+  elif state["confidence"] > 0.5:
+    return "medium_confidence_handler"
+  else:
+    return "low_confidence_handler"
+
+graph_builder.add_conditional_edges(
+  "decision_node",           # 来源节点
+  router_function,           # 路由函数
+  {                          # 路由映射
+    "high_confidence_handler": "execute_directly",
+    "medium_confidence_handler": "request_review",
+    "low_confidence_handler": "ask_user"
+  }
+)
+```
+
+执行流程动态:
+
+```
+decision_node →
+  ├─ 高置信度 → execute_directly
+  ├─ 中置信度 → request_review
+  └─ 低置信度 → ask_user
+```
+
+**特殊节点:START 和 END**
+
+```python
+from langgraph.graph import START, END
+
+# START: 图的入口点
+graph_builder.add_edge(START, "first_node")
+
+# END: 图的出口点
+graph_builder.add_edge("last_node", END)
+```
+
+**条件边的高级用法**
+
+```python
+# 实现循环:条件边指向之前的节点
+def should_continue(state: State) -> str:
+  if state["iteration_count"] < 3:
+    return "generate_again"  # 回到之前的节点
+  else:
+    return "finalize"        # 继续向前
+
+graph_builder.add_conditional_edges(
+  "evaluate",
+  should_continue,
+  {
+    "generate_again": "generate",  # 循环回去
+    "finalize": "finalize"         # 结束循环
+  }
+)
+```
+
+流程图:
+
+```
+generate → evaluate →
+    ↑         ↓
+    └─────────┘ (循环,如果iteration_count < 3)
+           OR
+           ↓
+        finalize (结束循环)
+```
+
+#### 2.5 核心抽象之间的关系
+
+**关系图**
+
+```
+┌─────────────────────────────────────────┐
+│            StateGraph                   │  顶层容器
+│  ┌─────────────────────────────────┐   │
+│  │         State                   │   │  共享记忆
+│  │  ┌──────────────────────────┐   │   │
+│  │  │ messages: list           │   │   │
+│  │  │ task_status: str         │   │   │
+│  │  │ iteration_count: int     │   │   │
+│  │  └──────────────────────────┘   │   │
+│  └─────────────────────────────────┘   │
+│                                         │
+│  ┌────────┐  Edge   ┌────────┐         │
+│  │ Node A │ ──────→ │ Node B │         │  节点和边
+│  └────────┘         └────────┘         │
+│      ↓                   ↓              │
+│   读取State           读取State         │
+│   返回更新            返回更新          │
+└─────────────────────────────────────────┘
+```
+
+**协同工作流程**
+
+1. **初始化**: 用户提供初始状态 → StateGraph 创建状态快照
+2. **节点执行**: 节点读取当前状态 → 执行任务 → 返回状态更新
+3. **状态合并**: StateGraph 将节点返回的更新合并到状态中
+4. **边路由**: 根据边的定义,决定下一个执行的节点
+5. **持久化**: (如果启用 Checkpointer)保存当前状态到存储
+6. **重复**: 继续执行下一个节点,直到到达 END
+
+**数据流示例**
+
+```
+初始状态: {"messages": [], "count": 0}
+
+↓ 执行 node_1
+node_1 返回: {"messages": ["Hello"], "count": 1}
+合并后状态: {"messages": ["Hello"], "count": 1}
+
+↓ 执行 node_2
+node_2 返回: {"messages": ["World"]}  # 只更新messages
+合并后状态: {"messages": ["Hello", "World"], "count": 1}  # count保持不变
+
+↓ 到达 END
+最终状态: {"messages": ["Hello", "World"], "count": 1}
+```
+
+**关键理解**
+
+1. **State 是中心**: 所有节点都围绕 State 工作,读取它、更新它
+2. **Node 是无状态的**: 节点不存储数据,只负责转换
+3. **Edge 是控制流**: 边决定执行顺序,但不传递数据
+4. **StateGraph 是协调者**: 负责状态管理、节点调度、历史记录
+
+**与传统编程的对比**
+
+| 传统编程 | LangGraph |
+|---------|-----------|
+| 函数通过参数和返回值传递数据 | 节点通过共享状态传递数据 |
+| if-else 控制流程 | 条件边控制流程 |
+| 变量保存状态 | State TypedDict 保存状态 |
+| 手动管理状态历史 | StateGraph 自动持久化 |
+
+**小结**
+
+LangGraph 的四个核心抽象形成了一个优雅的模型:
+
+- **StateGraph** 是容器,管理整个工作流
+- **State** 是记忆,在节点间共享上下文
+- **Node** 是执行单元,实现具体逻辑
+- **Edge** 是路由,控制执行顺序
+
+理解这四者的关系,就能用 LangGraph 构建任意复杂的 Agent 工作流。
+
+---
