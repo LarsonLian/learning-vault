@@ -1163,3 +1163,479 @@ result = graph.invoke(initial_state, config=config)
 这个快速上手示例展示了 LangGraph 的核心工作方式。虽然简单,但已经包含了状态管理、条件路由等关键概念。在后续章节中,我们会深入学习更高级的特性。
 
 ---
+
+## 第二篇:核心能力深入
+
+每章遵循"概念→实战→最佳实践"三段式结构
+
+### 第 5 章:状态管理 - 设计你的 Agent 记忆
+
+状态(State)是 LangGraph 的核心,它决定了 Agent 能记住什么、如何记住、记住多久。良好的状态设计是构建可靠 Agent 的基础。
+
+#### 5.1 概念讲解
+
+##### 5.1.1 State Schema 设计原则
+
+State Schema 定义了 Agent 的"记忆结构"。设计时需要考虑:
+
+**原则1:包含所有必要信息**
+
+```python
+# ❌ 不好:信息不足
+class State(TypedDict):
+    messages: list
+
+# ✅ 好:包含完整上下文
+class State(TypedDict):
+    messages: list[Message]       # 对话历史
+    current_task: str             # 当前任务
+    user_context: dict            # 用户信息
+    iteration_count: int          # 迭代次数
+```
+
+**原则2:避免冗余字段**
+
+```python
+# ❌ 不好:同一信息的多种表示
+class State(TypedDict):
+    task_description: str
+    task_title: str               # 冗余
+    task_summary: str             # 冗余
+
+# ✅ 好:单一信息源
+class State(TypedDict):
+    task: Task  # 包含所有任务信息的对象
+```
+
+**原则3:合理的字段类型**
+
+```python
+# 基础类型
+class State(TypedDict):
+    count: int
+    score: float
+    is_approved: bool
+    status: Literal["pending", "approved", "rejected"]
+
+# 复合类型
+class State(TypedDict):
+    messages: list[Message]
+    metadata: dict[str, any]
+    tools_used: set[str]
+
+# 自定义类型
+class TaskInfo(TypedDict):
+    title: str
+    priority: int
+    deadline: str
+
+class State(TypedDict):
+    tasks: list[TaskInfo]
+```
+
+**原则4:扁平化优于嵌套**
+
+```python
+# ❌ 避免:深层嵌套
+class State(TypedDict):
+    project: dict  # {"team": {"members": [{"name": "...", "role": "..."}]}}
+
+# ✅ 推荐:扁平结构
+class State(TypedDict):
+    project_name: str
+    team_members: list[dict]  # [{"name": "...", "role": "..."}]
+```
+
+##### 5.1.2 Reducer 函数详解
+
+Reducer 函数控制状态字段的更新策略。LangGraph 提供三种模式:
+
+**模式1:覆盖模式(默认)**
+
+```python
+class State(TypedDict):
+    counter: int  # 默认行为:新值覆盖旧值
+
+# 节点返回 {"counter": 5}
+# 状态更新: counter = 5 (直接覆盖)
+```
+
+适用场景:
+- 标量值(int, float, str, bool)
+- 状态标志位
+- 最新的单一值
+
+**模式2:累加模式(使用 operator.add)**
+
+```python
+from typing import Annotated
+from operator import add
+
+class State(TypedDict):
+    items: Annotated[list, add]
+
+# 初始: items = [1, 2]
+# 节点返回: {"items": [3, 4]}
+# 结果: items = [1, 2, 3, 4]  # 自动合并
+```
+
+适用场景:
+- 列表累积
+- 集合合并
+- 字符串拼接
+
+**模式3:自定义 Reducer**
+
+```python
+def merge_with_deduplication(
+    existing: list[str],
+    new: list[str]
+) -> list[str]:
+    """合并列表并去重"""
+    return list(set(existing + new))
+
+class State(TypedDict):
+    tags: Annotated[list[str], merge_with_deduplication]
+
+# 初始: tags = ["python", "ai"]
+# 节点返回: {"tags": ["ai", "ml"]}
+# 结果: tags = ["python", "ai", "ml"]  # 去重后
+```
+
+**内置 Reducer:add_messages**
+
+专为对话场景设计的高级 reducer:
+
+```python
+from langgraph.graph.message import add_messages
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+# add_messages 的特殊能力:
+
+# 1. 自动类型转换
+node_returns = {"messages": [{"role": "user", "content": "hi"}]}
+# 自动转换为 HumanMessage 对象
+
+# 2. 基于ID更新(而不是追加)
+# 如果新消息的ID已存在,更新该消息而不是追加
+existing_messages = [Message(id="msg1", content="old")]
+new_messages = [Message(id="msg1", content="updated")]
+# 结果: [Message(id="msg1", content="updated")]  # 更新而非追加
+
+# 3. 正确处理 tool_calls 和 tool_results
+# 自动关联工具调用和工具结果
+```
+
+**自定义 Reducer 示例:保留最近 N 条**
+
+```python
+def keep_recent(n: int):
+    """工厂函数:创建保留最近N条的reducer"""
+    def reducer(existing: list, new: list) -> list:
+        combined = existing + new
+        return combined[-n:]  # 只保留最后N个
+    return reducer
+
+class State(TypedDict):
+    # 只保留最近10条消息
+    messages: Annotated[list, keep_recent(10)]
+```
+
+##### 5.1.3 状态访问模式
+
+**只读访问**
+
+```python
+def my_node(state: State) -> dict:
+    # state 是当前状态的不可变副本
+    current_count = state["counter"]
+
+    # ❌ 错误:不要直接修改 state
+    # state["counter"] += 1
+
+    # ✅ 正确:返回更新
+    return {"counter": current_count + 1}
+```
+
+**条件更新**
+
+```python
+def conditional_update(state: State) -> dict:
+    """只在特定条件下更新"""
+    if state["score"] > 0.8:
+        return {"status": "approved"}
+    else:
+        return {}  # 返回空字典,不更新任何字段
+```
+
+**批量更新**
+
+```python
+def batch_update(state: State) -> dict:
+    """一次更新多个字段"""
+    return {
+        "status": "completed",
+        "score": 0.95,
+        "timestamp": current_time(),
+        "result": compute_result(state)
+    }
+```
+
+#### 5.2 实战片段:项目管理助手的状态设计
+
+让我们设计智能项目管理助手的完整状态结构:
+
+```python
+from typing import Annotated, Literal
+from typing_extensions import TypedDict
+from langgraph.graph.message import add_messages
+from operator import add
+
+# 任务信息
+class Task(TypedDict):
+    id: str
+    title: str
+    description: str
+    priority: Literal["high", "medium", "low"]
+    status: Literal["pending", "in_progress", "completed"]
+    assigned_to: str | None
+    estimated_hours: int
+    subtasks: list[str]  # 子任务ID列表
+
+# 主状态
+class ProjectManagerState(TypedDict):
+    # 1. 对话历史 - 使用 add_messages
+    messages: Annotated[list, add_messages]
+
+    # 2. 任务列表 - 使用 add 累加
+    tasks: Annotated[list[Task], add]
+
+    # 3. 当前上下文 - 覆盖模式
+    current_task_id: str | None
+    current_operation: Literal["create", "update", "query", "delete"] | None
+
+    # 4. 工作流状态 - 覆盖模式
+    workflow_stage: Literal["intake", "analysis", "execution", "review"]
+    needs_approval: bool
+    approval_context: dict | None
+
+    # 5. 迭代计数 - 覆盖模式
+    iteration_count: int
+    max_iterations: int
+
+    # 6. 错误处理 - 使用自定义 reducer
+    errors: Annotated[list[str], lambda old, new: old[-5:] + new]  # 只保留最近5个错误
+```
+
+**状态字段说明**
+
+| 字段 | Reducer | 用途 | 示例值 |
+|------|---------|------|--------|
+| `messages` | add_messages | 完整对话历史 | [HumanMessage(...), AIMessage(...)] |
+| `tasks` | add | 任务累积列表 | [Task(...), Task(...)] |
+| `current_task_id` | 覆盖 | 当前操作的任务 | "task_001" |
+| `workflow_stage` | 覆盖 | 当前工作流阶段 | "analysis" |
+| `needs_approval` | 覆盖 | 是否需要审批 | true |
+| `iteration_count` | 覆盖 | 当前迭代次数 | 2 |
+| `errors` | 自定义 | 错误历史(最近5条) | ["Error 1", "Error 2"] |
+
+**节点如何使用这个状态**
+
+```python
+def create_task_node(state: ProjectManagerState) -> dict:
+    """创建任务节点"""
+    # 1. 读取对话历史,提取任务信息
+    last_message = state["messages"][-1]
+    task_info = extract_task_info(last_message)
+
+    # 2. 创建新任务
+    new_task = Task(
+        id=generate_id(),
+        title=task_info["title"],
+        priority=task_info.get("priority", "medium"),
+        status="pending",
+        ...
+    )
+
+    # 3. 返回状态更新
+    return {
+        "tasks": [new_task],              # 追加到任务列表
+        "current_task_id": new_task["id"], # 更新当前任务ID
+        "workflow_stage": "execution",     # 更新工作流阶段
+        "messages": [AIMessage(f"已创建任务: {new_task['title']}")]
+    }
+
+def route_by_complexity(state: ProjectManagerState) -> str:
+    """根据任务复杂度路由"""
+    current_task = find_task(state["tasks"], state["current_task_id"])
+
+    if current_task["priority"] == "high" or current_task["estimated_hours"] > 40:
+        return "complex_task_handler"
+    else:
+        return "simple_task_handler"
+```
+
+#### 5.3 最佳实践
+
+##### 5.3.1 保持状态扁平化
+
+**原则**: 避免深层嵌套,优先使用扁平结构
+
+**反例:深层嵌套**
+
+```python
+# ❌ 不好:3层嵌套
+class State(TypedDict):
+    project: dict  # {
+                   #   "info": {"name": "...", "id": "..."},
+                   #   "team": {
+                   #     "members": [{"name": "...", "skills": ["..."]}]
+                   #   }
+                   # }
+```
+
+问题:
+- 访问困难: `state["project"]["team"]["members"][0]["skills"]`
+- 更新复杂: 需要深拷贝避免意外修改
+- 难以追踪变化
+
+**正例:扁平化**
+
+```python
+# ✅ 好:扁平结构
+class Member(TypedDict):
+    name: str
+    skills: list[str]
+
+class State(TypedDict):
+    project_name: str
+    project_id: str
+    team_members: list[Member]
+```
+
+优势:
+- 访问简单: `state["project_name"]`, `state["team_members"]`
+- 更新清晰: `return {"project_name": "NewName"}`
+- 易于理解
+
+##### 5.3.2 合理使用 Reducer
+
+**原则**: 根据数据特性选择合适的 reducer
+
+**场景1:累积日志/历史**
+
+```python
+# ✅ 使用 add
+class State(TypedDict):
+    logs: Annotated[list[str], add]
+
+# 节点可以持续追加日志
+return {"logs": [f"Step {i} completed"]}
+```
+
+**场景2:唯一值集合**
+
+```python
+# ✅ 使用自定义 reducer 去重
+def merge_unique(old: list, new: list) -> list:
+    return list(set(old + new))
+
+class State(TypedDict):
+    tags: Annotated[list[str], merge_unique]
+```
+
+**场景3:最新状态**
+
+```python
+# ✅ 使用默认覆盖
+class State(TypedDict):
+    current_stage: str
+    latest_score: float
+
+# 总是使用最新值
+return {"current_stage": "review", "latest_score": 0.92}
+```
+
+**场景4:有界历史**
+
+```python
+# ✅ 使用自定义 reducer 限制大小
+def keep_last_n(n: int):
+    def reducer(old: list, new: list) -> list:
+        return (old + new)[-n:]
+    return reducer
+
+class State(TypedDict):
+    recent_messages: Annotated[list, keep_last_n(100)]
+```
+
+##### 5.3.3 状态版本化策略
+
+**原则**: 在状态结构可能变化时,提供平滑的迁移路径
+
+**策略1:版本号字段**
+
+```python
+class State(TypedDict):
+    schema_version: int  # 当前状态结构版本
+    # ... 其他字段
+
+def migrate_state(state: dict) -> dict:
+    """迁移旧版本状态到新版本"""
+    version = state.get("schema_version", 1)
+
+    if version == 1:
+        # v1 -> v2: 添加新字段
+        state["new_field"] = default_value
+        state["schema_version"] = 2
+
+    if version == 2:
+        # v2 -> v3: 重命名字段
+        state["renamed_field"] = state.pop("old_field")
+        state["schema_version"] = 3
+
+    return state
+```
+
+**策略2:可选字段**
+
+```python
+from typing import NotRequired
+
+class State(TypedDict):
+    required_field: str
+    optional_field: NotRequired[str]  # 新版本添加的字段
+
+# 兼容旧状态
+def node(state: State) -> dict:
+    optional_value = state.get("optional_field", "default")
+    # ...
+```
+
+**策略3:向后兼容的 Reducer**
+
+```python
+def backward_compatible_add(old: list | None, new: list) -> list:
+    """兼容 None 值的 add reducer"""
+    if old is None:
+        return new
+    return old + new
+
+class State(TypedDict):
+    items: Annotated[list | None, backward_compatible_add]
+```
+
+**小结**
+
+良好的状态管理:
+- ✅ 使用 TypedDict 明确定义结构
+- ✅ 选择合适的 reducer 策略
+- ✅ 保持扁平化,避免深层嵌套
+- ✅ 只存储必要信息,避免冗余
+- ✅ 考虑版本演进和兼容性
+
+状态是 Agent 的记忆,设计得当能让 Agent 更智能、更可靠。
+
+---
