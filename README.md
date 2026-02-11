@@ -31,17 +31,35 @@ Claude Code 开发指南完整文档集，涵盖架构、上下文工程、子�
   - `SYNC_LOG.md` - 同步日志记录
   - `README.md` - Agent 开发入门指南
 
+### 📊 langgraph/
+LangGraph 完整学习指南,涵盖从基础概念到生产部署的所有知识点。
+
+**主要文档:**
+- `LangGraph-Guide.md` - 15章完整教程(19万字深度指南)
+- `LangGraph-QuickRef.md` - 快速参考速查手册
+- `LEARNING-CHECKLIST.md` - 系统化学习检查清单
+- `README.md` - 学习路径与章节索引
+
+**核心内容:**
+- **基础知识篇** (第1-4章): LangGraph 核心概念与快速上手
+- **核心能力篇** (第5-10章): 状态管理、条件路由、并行执行、人机协作、持久化、模块化
+- **实战模式篇** (第11-15章): 完整案例、架构模式、性能优化、错误处理、测试调试
+
+**子目录:**
+- `examples/` - 完整项目案例和代码示例
+
 ### 🤖 nanobot/
 Nanobot 架构分析与技术文档。
 
-**文档：**
+**文档:**
 - `2026-02-10-nanobot-architecture-deep-dive.md` - Nanobot 架构深度剖析
 
 ## 使用说明
 
-1. **学习 Claude Code 开发**：从 `claude-code-guide/README.md` 开始，按章节顺序阅读
-2. **开发 Agent**：参考 `claude-code-guide/开发agent/` 目录下的实战资源
-3. **了解 Nanobot**：查阅 `nanobot/` 目录下的架构分析文档
+1. **学习 Claude Code 开发**: 从 `claude-code-guide/README.md` 开始,按章节顺序阅读
+2. **学习 LangGraph**: 从 `langgraph/README.md` 开始,根据学习路径选择对应章节
+3. **开发 Agent**: 参考 `claude-code-guide/开发agent/` 目录下的实战资源
+4. **了解 Nanobot**: 查阅 `nanobot/` 目录下的架构分析文档
 
 ## 许可证
 
