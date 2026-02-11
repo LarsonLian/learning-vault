@@ -3944,3 +3944,3482 @@ WHERE id NOT IN (
 持久化让 Agent 能够跨会话、跨故障运行,是生产级应用的基础设施。
 
 ---
+
+## 第三篇:高级特性篇
+
+掌握复杂场景的解决方案
+
+### 第 10 章:子图与模块化
+
+#### 10.1 为什么需要子图?
+
+**问题背景**
+
+随着 Agent 应用复杂度增加,我们会遇到以下挑战:
+
+**挑战1:图结构过于复杂**
+
+```
+一个包含 20+ 节点的扁平图:
+
+start → analyze → classify → route1 → route2 → route3 →
+validate1 → validate2 → format1 → format2 → review1 →
+review2 → approve1 → approve2 → execute1 → execute2 →
+notify1 → notify2 → log1 → log2 → end
+```
+
+问题:
+- 难以理解整体逻辑
+- 修改一个部分容易影响其他部分
+- 测试困难,无法单独测试某个逻辑块
+- 代码复用困难
+
+**挑战2:职责边界不清晰**
+
+```
+项目管理 Agent 的图结构:
+
+需求分析 → 任务分解 → 资源分配 → 进度跟踪 →
+风险评估 → 报告生成 → 通知发送
+
+每个环节都很复杂,混在一起难以维护
+```
+
+**挑战3:团队协作困难**
+
+```
+团队 A: 负责需求分析模块
+团队 B: 负责任务执行模块
+团队 C: 负责报告生成模块
+
+如果在同一个图中开发,容易产生冲突
+```
+
+**子图的价值**
+
+SubGraph(子图)是 LangGraph 提供的模块化机制,它允许:
+
+1. **层次化组织**: 将复杂图分解为多个逻辑单元
+2. **关注点分离**: 每个子图专注于一个职责
+3. **代码复用**: 子图可以在多个父图中复用
+4. **独立测试**: 每个子图可以单独测试
+5. **团队协作**: 不同团队可以独立开发各自的子图
+
+#### 10.2 子图基础
+
+##### 10.2.1 创建和使用子图
+
+**基本概念**
+
+子图本质上是一个完整的 LangGraph 图,可以作为节点嵌入到另一个图中。
+
+**简单示例:验证模块**
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph
+
+# 1. 定义子图的状态
+class ValidationState(TypedDict):
+    content: str
+    is_valid: bool
+    errors: list[str]
+
+# 2. 创建子图
+def create_validation_subgraph():
+    """创建一个内容验证子图"""
+    builder = StateGraph(ValidationState)
+
+    def check_length(state: ValidationState) -> dict:
+        """检查长度"""
+        content = state["content"]
+        errors = state.get("errors", [])
+
+        if len(content) < 10:
+            errors.append("内容太短")
+        if len(content) > 1000:
+            errors.append("内容太长")
+
+        return {"errors": errors}
+
+    def check_format(state: ValidationState) -> dict:
+        """检查格式"""
+        content = state["content"]
+        errors = state.get("errors", [])
+
+        if not content.strip():
+            errors.append("内容为空")
+
+        return {"errors": errors}
+
+    def finalize(state: ValidationState) -> dict:
+        """最终判断"""
+        is_valid = len(state.get("errors", [])) == 0
+        return {"is_valid": is_valid}
+
+    # 构建子图
+    builder.add_node("check_length", check_length)
+    builder.add_node("check_format", check_format)
+    builder.add_node("finalize", finalize)
+
+    builder.set_entry_point("check_length")
+    builder.add_edge("check_length", "check_format")
+    builder.add_edge("check_format", "finalize")
+    builder.set_finish_point("finalize")
+
+    return builder.compile()
+
+# 3. 在父图中使用子图
+class MainState(TypedDict):
+    user_input: str
+    validation_result: bool
+    final_output: str
+
+def create_main_graph():
+    """创建主图"""
+    builder = StateGraph(MainState)
+
+    # 创建子图实例
+    validation_subgraph = create_validation_subgraph()
+
+    def prepare_validation(state: MainState) -> dict:
+        """准备验证输入"""
+        return {
+            "content": state["user_input"],
+            "errors": []
+        }
+
+    def run_validation(state: MainState) -> dict:
+        """运行验证子图"""
+        # 调用子图
+        result = validation_subgraph.invoke({
+            "content": state["user_input"],
+            "is_valid": False,
+            "errors": []
+        })
+
+        return {"validation_result": result["is_valid"]}
+
+    def process_result(state: MainState) -> dict:
+        """处理验证结果"""
+        if state["validation_result"]:
+            return {"final_output": "验证通过,继续处理"}
+        else:
+            return {"final_output": "验证失败,请修改输入"}
+
+    builder.add_node("run_validation", run_validation)
+    builder.add_node("process_result", process_result)
+
+    builder.set_entry_point("run_validation")
+    builder.add_edge("run_validation", "process_result")
+    builder.set_finish_point("process_result")
+
+    return builder.compile()
+
+# 使用
+graph = create_main_graph()
+result = graph.invoke({
+    "user_input": "这是一段测试内容",
+    "validation_result": False,
+    "final_output": ""
+})
+print(result["final_output"])
+```
+
+##### 10.2.2 父子图状态映射
+
+**核心挑战**
+
+父图和子图通常有不同的状态结构,需要进行状态映射。
+
+**映射策略1:手动映射(推荐)**
+
+```python
+class ParentState(TypedDict):
+    user_input: str
+    processing_data: dict
+    result: str
+
+class ChildState(TypedDict):
+    input_text: str
+    output_text: str
+
+def create_child_graph():
+    """子图"""
+    builder = StateGraph(ChildState)
+
+    def process(state: ChildState) -> dict:
+        return {"output_text": state["input_text"].upper()}
+
+    builder.add_node("process", process)
+    builder.set_entry_point("process")
+    builder.set_finish_point("process")
+
+    return builder.compile()
+
+def create_parent_graph():
+    """父图"""
+    builder = StateGraph(ParentState)
+
+    child_graph = create_child_graph()
+
+    def invoke_child(state: ParentState) -> dict:
+        """调用子图,手动映射状态"""
+        # 父状态 → 子状态
+        child_input = {
+            "input_text": state["user_input"],
+            "output_text": ""
+        }
+
+        # 执行子图
+        child_output = child_graph.invoke(child_input)
+
+        # 子状态 → 父状态
+        return {
+            "result": child_output["output_text"],
+            "processing_data": {"child_output": child_output}
+        }
+
+    builder.add_node("invoke_child", invoke_child)
+    builder.set_entry_point("invoke_child")
+    builder.set_finish_point("invoke_child")
+
+    return builder.compile()
+```
+
+**映射策略2:共享状态结构**
+
+```python
+# 定义共享的基础状态
+class BaseState(TypedDict):
+    id: str
+    timestamp: str
+
+class ParentState(BaseState):
+    """父图状态,继承基础状态"""
+    user_input: str
+    result: str
+
+class ChildState(BaseState):
+    """子图状态,继承基础状态"""
+    data: str
+
+def create_child_graph():
+    builder = StateGraph(ChildState)
+
+    def process(state: ChildState) -> dict:
+        # 可以访问 id 和 timestamp
+        return {
+            "data": f"Processed at {state['timestamp']}"
+        }
+
+    builder.add_node("process", process)
+    builder.set_entry_point("process")
+    builder.set_finish_point("process")
+
+    return builder.compile()
+
+def create_parent_graph():
+    builder = StateGraph(ParentState)
+
+    child_graph = create_child_graph()
+
+    def invoke_child(state: ParentState) -> dict:
+        # 传递共享字段
+        child_output = child_graph.invoke({
+            "id": state["id"],
+            "timestamp": state["timestamp"],
+            "data": state["user_input"]
+        })
+
+        return {"result": child_output["data"]}
+
+    builder.add_node("invoke_child", invoke_child)
+    builder.set_entry_point("invoke_child")
+    builder.set_finish_point("invoke_child")
+
+    return builder.compile()
+```
+
+**映射策略3:使用转换函数**
+
+```python
+def create_state_adapter(parent_to_child, child_to_parent):
+    """创建状态适配器"""
+    def adapter(child_graph):
+        def adapted_node(parent_state):
+            # 转换
+            child_input = parent_to_child(parent_state)
+            # 执行
+            child_output = child_graph.invoke(child_input)
+            # 转换回来
+            return child_to_parent(parent_state, child_output)
+
+        return adapted_node
+
+    return adapter
+
+# 使用
+def parent_to_child_mapper(parent_state: ParentState) -> ChildState:
+    """父状态 → 子状态"""
+    return {
+        "input_text": parent_state["user_input"],
+        "output_text": ""
+    }
+
+def child_to_parent_mapper(parent_state: ParentState, child_state: ChildState) -> dict:
+    """子状态 → 父状态更新"""
+    return {
+        "result": child_state["output_text"]
+    }
+
+# 创建适配器
+adapter = create_state_adapter(
+    parent_to_child_mapper,
+    child_to_parent_mapper
+)
+
+# 在父图中使用
+child_graph = create_child_graph()
+adapted_child = adapter(child_graph)
+
+builder.add_node("child", adapted_child)
+```
+
+#### 10.3 图组合模式
+
+##### 10.3.1 模式1:串行组合
+
+**场景**: 多个子图按顺序执行
+
+```python
+class PipelineState(TypedDict):
+    raw_input: str
+    preprocessed: str
+    analyzed: str
+    final_output: str
+
+def create_preprocessing_graph():
+    """预处理子图"""
+    builder = StateGraph(PipelineState)
+
+    def clean_text(state: PipelineState) -> dict:
+        text = state["raw_input"].strip().lower()
+        return {"preprocessed": text}
+
+    builder.add_node("clean", clean_text)
+    builder.set_entry_point("clean")
+    builder.set_finish_point("clean")
+
+    return builder.compile()
+
+def create_analysis_graph():
+    """分析子图"""
+    builder = StateGraph(PipelineState)
+
+    def analyze(state: PipelineState) -> dict:
+        text = state["preprocessed"]
+        result = f"分析结果: {len(text)} 字符"
+        return {"analyzed": result}
+
+    builder.add_node("analyze", analyze)
+    builder.set_entry_point("analyze")
+    builder.set_finish_point("analyze")
+
+    return builder.compile()
+
+def create_pipeline_graph():
+    """串行流水线"""
+    builder = StateGraph(PipelineState)
+
+    preprocess = create_preprocessing_graph()
+    analyze = create_analysis_graph()
+
+    def run_preprocess(state: PipelineState) -> dict:
+        result = preprocess.invoke(state)
+        return {"preprocessed": result["preprocessed"]}
+
+    def run_analyze(state: PipelineState) -> dict:
+        result = analyze.invoke(state)
+        return {"analyzed": result["analyzed"]}
+
+    def finalize(state: PipelineState) -> dict:
+        return {"final_output": state["analyzed"]}
+
+    builder.add_node("preprocess", run_preprocess)
+    builder.add_node("analyze", run_analyze)
+    builder.add_node("finalize", finalize)
+
+    builder.set_entry_point("preprocess")
+    builder.add_edge("preprocess", "analyze")
+    builder.add_edge("analyze", "finalize")
+    builder.set_finish_point("finalize")
+
+    return builder.compile()
+
+# 使用
+graph = create_pipeline_graph()
+result = graph.invoke({
+    "raw_input": "  Hello World  ",
+    "preprocessed": "",
+    "analyzed": "",
+    "final_output": ""
+})
+```
+
+**执行流程**:
+```
+raw_input
+   ↓
+[预处理子图] → preprocessed
+   ↓
+[分析子图] → analyzed
+   ↓
+finalize → final_output
+```
+
+##### 10.3.2 模式2:并行组合
+
+**场景**: 多个子图同时执行,聚合结果
+
+```python
+from typing import List
+
+class ParallelState(TypedDict):
+    input_data: str
+    results: List[str]
+    final_summary: str
+
+def create_analyzer_a():
+    """分析器A:检查长度"""
+    builder = StateGraph(ParallelState)
+
+    def analyze(state: ParallelState) -> dict:
+        length = len(state["input_data"])
+        return {"results": [f"长度: {length}"]}
+
+    builder.add_node("analyze", analyze)
+    builder.set_entry_point("analyze")
+    builder.set_finish_point("analyze")
+
+    return builder.compile()
+
+def create_analyzer_b():
+    """分析器B:检查单词数"""
+    builder = StateGraph(ParallelState)
+
+    def analyze(state: ParallelState) -> dict:
+        words = len(state["input_data"].split())
+        return {"results": [f"单词数: {words}"]}
+
+    builder.add_node("analyze", analyze)
+    builder.set_entry_point("analyze")
+    builder.set_finish_point("analyze")
+
+    return builder.compile()
+
+def create_parallel_graph():
+    """并行执行多个分析器"""
+    builder = StateGraph(ParallelState)
+
+    analyzer_a = create_analyzer_a()
+    analyzer_b = create_analyzer_b()
+
+    def run_analyzer_a(state: ParallelState) -> dict:
+        result = analyzer_a.invoke(state)
+        return {"results": state.get("results", []) + result["results"]}
+
+    def run_analyzer_b(state: ParallelState) -> dict:
+        result = analyzer_b.invoke(state)
+        return {"results": state.get("results", []) + result["results"]}
+
+    def aggregate(state: ParallelState) -> dict:
+        summary = " | ".join(state["results"])
+        return {"final_summary": summary}
+
+    builder.add_node("analyzer_a", run_analyzer_a)
+    builder.add_node("analyzer_b", run_analyzer_b)
+    builder.add_node("aggregate", aggregate)
+
+    builder.set_entry_point("analyzer_a")
+    builder.add_edge("analyzer_a", "analyzer_b")
+    builder.add_edge("analyzer_b", "aggregate")
+    builder.set_finish_point("aggregate")
+
+    return builder.compile()
+
+# 注意:真正的并行需要使用 Send API(高级特性)
+# 这里的示例是串行执行但逻辑上独立的子图
+```
+
+**真正的并行执行**(使用 Send API):
+
+```python
+from langgraph.constants import Send
+
+def create_true_parallel_graph():
+    """真正的并行执行"""
+    builder = StateGraph(ParallelState)
+
+    analyzer_a = create_analyzer_a()
+    analyzer_b = create_analyzer_b()
+
+    def fan_out(state: ParallelState):
+        """扇出:启动多个并行任务"""
+        return [
+            Send("analyzer_a", state),
+            Send("analyzer_b", state)
+        ]
+
+    def run_analyzer_a(state: ParallelState) -> dict:
+        result = analyzer_a.invoke(state)
+        return {"results": result["results"]}
+
+    def run_analyzer_b(state: ParallelState) -> dict:
+        result = analyzer_b.invoke(state)
+        return {"results": result["results"]}
+
+    def aggregate(state: ParallelState) -> dict:
+        summary = " | ".join(state["results"])
+        return {"final_summary": summary}
+
+    builder.add_node("fan_out", fan_out)
+    builder.add_node("analyzer_a", run_analyzer_a)
+    builder.add_node("analyzer_b", run_analyzer_b)
+    builder.add_node("aggregate", aggregate)
+
+    builder.set_entry_point("fan_out")
+    # fan_out 返回 Send 对象,自动路由到对应节点
+    builder.add_edge("analyzer_a", "aggregate")
+    builder.add_edge("analyzer_b", "aggregate")
+    builder.set_finish_point("aggregate")
+
+    return builder.compile()
+```
+
+##### 10.3.3 模式3:条件组合
+
+**场景**: 根据条件选择不同的子图
+
+```python
+class RoutingState(TypedDict):
+    task_type: str
+    input_data: str
+    output: str
+
+def create_simple_processor():
+    """简单处理器"""
+    builder = StateGraph(RoutingState)
+
+    def process(state: RoutingState) -> dict:
+        return {"output": f"简单处理: {state['input_data']}"}
+
+    builder.add_node("process", process)
+    builder.set_entry_point("process")
+    builder.set_finish_point("process")
+
+    return builder.compile()
+
+def create_complex_processor():
+    """复杂处理器"""
+    builder = StateGraph(RoutingState)
+
+    def analyze(state: RoutingState) -> dict:
+        return {"output": f"复杂分析: {state['input_data']}"}
+
+    builder.add_node("analyze", analyze)
+    builder.set_entry_point("analyze")
+    builder.set_finish_point("analyze")
+
+    return builder.compile()
+
+def create_routing_graph():
+    """条件路由图"""
+    builder = StateGraph(RoutingState)
+
+    simple_processor = create_simple_processor()
+    complex_processor = create_complex_processor()
+
+    def route_to_processor(state: RoutingState) -> dict:
+        """根据任务类型选择处理器"""
+        if state["task_type"] == "simple":
+            result = simple_processor.invoke(state)
+        else:
+            result = complex_processor.invoke(state)
+
+        return {"output": result["output"]}
+
+    builder.add_node("route", route_to_processor)
+    builder.set_entry_point("route")
+    builder.set_finish_point("route")
+
+    return builder.compile()
+
+# 使用
+graph = create_routing_graph()
+
+# 简单任务
+result1 = graph.invoke({
+    "task_type": "simple",
+    "input_data": "test",
+    "output": ""
+})
+
+# 复杂任务
+result2 = graph.invoke({
+    "task_type": "complex",
+    "input_data": "test",
+    "output": ""
+})
+```
+
+##### 10.3.4 模式4:递归组合
+
+**场景**: 子图包含对自身或其他子图的递归调用
+
+```python
+class RecursiveState(TypedDict):
+    items: List[str]
+    current_index: int
+    processed_items: List[str]
+
+def create_recursive_processor():
+    """递归处理器"""
+    builder = StateGraph(RecursiveState)
+
+    def process_item(state: RecursiveState) -> dict:
+        """处理当前项"""
+        items = state["items"]
+        current_index = state["current_index"]
+        processed = state.get("processed_items", [])
+
+        if current_index >= len(items):
+            # 递归终止
+            return {"processed_items": processed}
+
+        # 处理当前项
+        current_item = items[current_index]
+        processed_item = f"处理: {current_item}"
+        processed.append(processed_item)
+
+        return {
+            "current_index": current_index + 1,
+            "processed_items": processed
+        }
+
+    def should_continue(state: RecursiveState) -> str:
+        """判断是否继续递归"""
+        if state["current_index"] >= len(state["items"]):
+            return "done"
+        return "continue"
+
+    builder.add_node("process", process_item)
+    builder.set_entry_point("process")
+
+    builder.add_conditional_edges(
+        "process",
+        should_continue,
+        {
+            "continue": "process",  # 递归回到自己
+            "done": END
+        }
+    )
+
+    return builder.compile()
+
+# 使用
+graph = create_recursive_processor()
+result = graph.invoke({
+    "items": ["A", "B", "C"],
+    "current_index": 0,
+    "processed_items": []
+})
+print(result["processed_items"])
+# 输出: ['处理: A', '处理: B', '处理: C']
+```
+
+#### 10.4 实战案例:模块化的项目管理助手
+
+**场景**: 将项目管理助手分解为多个子图
+
+```python
+from typing import TypedDict, List
+
+# ============= 状态定义 =============
+
+class RequirementAnalysisState(TypedDict):
+    """需求分析子图状态"""
+    raw_requirement: str
+    analyzed_requirements: List[dict]
+    priority: str
+
+class TaskDecompositionState(TypedDict):
+    """任务分解子图状态"""
+    requirements: List[dict]
+    tasks: List[dict]
+
+class ResourceAllocationState(TypedDict):
+    """资源分配子图状态"""
+    tasks: List[dict]
+    available_resources: List[str]
+    allocated_tasks: List[dict]
+
+class ProjectState(TypedDict):
+    """主项目状态"""
+    user_input: str
+    requirements: List[dict]
+    tasks: List[dict]
+    allocated_tasks: List[dict]
+    project_plan: str
+
+# ============= 子图1: 需求分析 =============
+
+def create_requirement_analysis_subgraph():
+    """需求分析子图"""
+    builder = StateGraph(RequirementAnalysisState)
+
+    def parse_requirement(state: RequirementAnalysisState) -> dict:
+        """解析需求"""
+        raw = state["raw_requirement"]
+        # 简化:实际应该用 LLM
+        requirements = [
+            {"id": 1, "text": raw, "type": "feature"}
+        ]
+        return {"analyzed_requirements": requirements}
+
+    def classify_priority(state: RequirementAnalysisState) -> dict:
+        """分类优先级"""
+        # 简化:实际应该用 LLM
+        return {"priority": "high"}
+
+    builder.add_node("parse", parse_requirement)
+    builder.add_node("classify", classify_priority)
+
+    builder.set_entry_point("parse")
+    builder.add_edge("parse", "classify")
+    builder.set_finish_point("classify")
+
+    return builder.compile()
+
+# ============= 子图2: 任务分解 =============
+
+def create_task_decomposition_subgraph():
+    """任务分解子图"""
+    builder = StateGraph(TaskDecompositionState)
+
+    def decompose_to_tasks(state: TaskDecompositionState) -> dict:
+        """分解为任务"""
+        requirements = state["requirements"]
+        tasks = []
+
+        for req in requirements:
+            # 简化:实际应该用 LLM
+            tasks.append({
+                "id": len(tasks) + 1,
+                "requirement_id": req["id"],
+                "name": f"实现 {req['text']}",
+                "estimated_hours": 8
+            })
+
+        return {"tasks": tasks}
+
+    def validate_tasks(state: TaskDecompositionState) -> dict:
+        """验证任务"""
+        # 验证逻辑
+        return {}
+
+    builder.add_node("decompose", decompose_to_tasks)
+    builder.add_node("validate", validate_tasks)
+
+    builder.set_entry_point("decompose")
+    builder.add_edge("decompose", "validate")
+    builder.set_finish_point("validate")
+
+    return builder.compile()
+
+# ============= 子图3: 资源分配 =============
+
+def create_resource_allocation_subgraph():
+    """资源分配子图"""
+    builder = StateGraph(ResourceAllocationState)
+
+    def allocate_resources(state: ResourceAllocationState) -> dict:
+        """分配资源"""
+        tasks = state["tasks"]
+        resources = state["available_resources"]
+
+        allocated = []
+        for i, task in enumerate(tasks):
+            resource = resources[i % len(resources)]
+            allocated.append({
+                **task,
+                "assigned_to": resource
+            })
+
+        return {"allocated_tasks": allocated}
+
+    builder.add_node("allocate", allocate_resources)
+    builder.set_entry_point("allocate")
+    builder.set_finish_point("allocate")
+
+    return builder.compile()
+
+# ============= 主图: 组合所有子图 =============
+
+def create_project_management_graph():
+    """项目管理主图"""
+    builder = StateGraph(ProjectState)
+
+    # 创建子图实例
+    requirement_analysis = create_requirement_analysis_subgraph()
+    task_decomposition = create_task_decomposition_subgraph()
+    resource_allocation = create_resource_allocation_subgraph()
+
+    def analyze_requirements(state: ProjectState) -> dict:
+        """运行需求分析子图"""
+        result = requirement_analysis.invoke({
+            "raw_requirement": state["user_input"],
+            "analyzed_requirements": [],
+            "priority": ""
+        })
+
+        return {"requirements": result["analyzed_requirements"]}
+
+    def decompose_tasks(state: ProjectState) -> dict:
+        """运行任务分解子图"""
+        result = task_decomposition.invoke({
+            "requirements": state["requirements"],
+            "tasks": []
+        })
+
+        return {"tasks": result["tasks"]}
+
+    def allocate_resources(state: ProjectState) -> dict:
+        """运行资源分配子图"""
+        result = resource_allocation.invoke({
+            "tasks": state["tasks"],
+            "available_resources": ["Alice", "Bob", "Charlie"],
+            "allocated_tasks": []
+        })
+
+        return {"allocated_tasks": result["allocated_tasks"]}
+
+    def generate_plan(state: ProjectState) -> dict:
+        """生成项目计划"""
+        tasks = state["allocated_tasks"]
+        plan_lines = ["项目计划:\n"]
+
+        for task in tasks:
+            plan_lines.append(
+                f"- {task['name']} "
+                f"({task['estimated_hours']}h) "
+                f"-> {task['assigned_to']}"
+            )
+
+        return {"project_plan": "\n".join(plan_lines)}
+
+    # 构建主图
+    builder.add_node("analyze", analyze_requirements)
+    builder.add_node("decompose", decompose_tasks)
+    builder.add_node("allocate", allocate_resources)
+    builder.add_node("generate_plan", generate_plan)
+
+    builder.set_entry_point("analyze")
+    builder.add_edge("analyze", "decompose")
+    builder.add_edge("decompose", "allocate")
+    builder.add_edge("allocate", "generate_plan")
+    builder.set_finish_point("generate_plan")
+
+    return builder.compile()
+
+# ============= 使用 =============
+
+graph = create_project_management_graph()
+
+result = graph.invoke({
+    "user_input": "开发一个用户登录功能",
+    "requirements": [],
+    "tasks": [],
+    "allocated_tasks": [],
+    "project_plan": ""
+})
+
+print(result["project_plan"])
+```
+
+**输出**:
+```
+项目计划:
+
+- 实现 开发一个用户登录功能 (8h) -> Alice
+```
+
+**架构优势**:
+
+| 方面 | 单一图 | 子图模式 |
+|------|--------|----------|
+| **可读性** | 节点过多,难以理解 | 层次清晰,易于理解 |
+| **可维护性** | 修改影响范围大 | 修改局限在子图内 |
+| **可测试性** | 只能整体测试 | 每个子图独立测试 |
+| **可复用性** | 难以复用 | 子图可在多处复用 |
+| **团队协作** | 容易冲突 | 并行开发不冲突 |
+
+#### 10.5 最佳实践
+
+##### 10.5.1 子图设计原则
+
+**原则1:单一职责**
+
+每个子图应该只做一件事情。
+
+```python
+# ❌ 不好:一个子图做太多事情
+def create_everything_subgraph():
+    """一个子图处理所有逻辑"""
+    # 包含:验证、分析、转换、存储...
+    # 太复杂,难以维护
+
+# ✅ 好:每个子图专注一个职责
+def create_validation_subgraph():
+    """只负责验证"""
+    pass
+
+def create_analysis_subgraph():
+    """只负责分析"""
+    pass
+
+def create_transformation_subgraph():
+    """只负责转换"""
+    pass
+```
+
+**原则2:明确的输入输出**
+
+子图的状态应该清晰定义输入和输出。
+
+```python
+# ✅ 好:明确的状态定义
+class ValidationInput(TypedDict):
+    """验证子图的输入"""
+    content: str
+    rules: List[str]
+
+class ValidationOutput(TypedDict):
+    """验证子图的输出"""
+    is_valid: bool
+    errors: List[str]
+    warnings: List[str]
+
+# 在文档中说明
+def create_validation_subgraph():
+    """
+    验证子图
+
+    输入:
+        - content: 待验证的内容
+        - rules: 验证规则列表
+
+    输出:
+        - is_valid: 是否通过验证
+        - errors: 错误列表
+        - warnings: 警告列表
+    """
+    pass
+```
+
+**原则3:最小化依赖**
+
+子图应该尽量减少对外部状态的依赖。
+
+```python
+# ❌ 不好:依赖全局状态
+global_config = {}
+
+def create_subgraph():
+    def process(state):
+        # 依赖全局变量
+        setting = global_config["setting"]
+        return {}
+
+# ✅ 好:依赖注入
+def create_subgraph(config: dict):
+    """通过参数传入依赖"""
+    def process(state):
+        setting = config["setting"]
+        return {}
+
+    # 构建图...
+    return builder.compile()
+```
+
+##### 10.5.2 状态映射策略
+
+**策略1:使用适配器模式**
+
+```python
+class StateAdapter:
+    """状态适配器"""
+
+    def __init__(self, subgraph, to_child, from_child):
+        self.subgraph = subgraph
+        self.to_child = to_child
+        self.from_child = from_child
+
+    def __call__(self, parent_state):
+        # 转换为子图状态
+        child_state = self.to_child(parent_state)
+
+        # 执行子图
+        result = self.subgraph.invoke(child_state)
+
+        # 转换回父图状态
+        return self.from_child(parent_state, result)
+
+# 使用
+validation_subgraph = create_validation_subgraph()
+
+adapter = StateAdapter(
+    subgraph=validation_subgraph,
+    to_child=lambda p: {"content": p["user_input"], "rules": []},
+    from_child=lambda p, c: {"is_valid": c["is_valid"]}
+)
+
+builder.add_node("validate", adapter)
+```
+
+**策略2:使用状态继承**
+
+```python
+class BaseState(TypedDict):
+    """基础状态"""
+    id: str
+    timestamp: str
+
+class ParentState(BaseState):
+    """继承基础状态"""
+    user_input: str
+
+class ChildState(BaseState):
+    """继承基础状态"""
+    processed_data: str
+
+# 自动共享 id 和 timestamp
+```
+
+##### 10.5.3 错误处理
+
+**原则**: 子图的错误应该向上传播
+
+```python
+class SubgraphState(TypedDict):
+    input: str
+    output: str
+    error: str  # 错误信息
+
+def create_subgraph():
+    builder = StateGraph(SubgraphState)
+
+    def risky_operation(state: SubgraphState) -> dict:
+        try:
+            result = do_something(state["input"])
+            return {"output": result, "error": ""}
+        except Exception as e:
+            return {"output": "", "error": str(e)}
+
+    builder.add_node("operation", risky_operation)
+    builder.set_entry_point("operation")
+    builder.set_finish_point("operation")
+
+    return builder.compile()
+
+def create_parent_graph():
+    builder = StateGraph(ParentState)
+
+    subgraph = create_subgraph()
+
+    def handle_subgraph(state: ParentState) -> dict:
+        result = subgraph.invoke({
+            "input": state["data"],
+            "output": "",
+            "error": ""
+        })
+
+        # 检查子图是否出错
+        if result["error"]:
+            return {"status": "error", "message": result["error"]}
+
+        return {"status": "success", "result": result["output"]}
+
+    builder.add_node("subgraph", handle_subgraph)
+    # ...
+```
+
+##### 10.5.4 测试策略
+
+**策略1:独立测试子图**
+
+```python
+import pytest
+
+def test_validation_subgraph():
+    """测试验证子图"""
+    graph = create_validation_subgraph()
+
+    # 测试通过情况
+    result = graph.invoke({
+        "content": "valid content",
+        "is_valid": False,
+        "errors": []
+    })
+    assert result["is_valid"] == True
+    assert len(result["errors"]) == 0
+
+    # 测试失败情况
+    result = graph.invoke({
+        "content": "",
+        "is_valid": False,
+        "errors": []
+    })
+    assert result["is_valid"] == False
+    assert len(result["errors"]) > 0
+```
+
+**策略2:使用 Mock 测试父图**
+
+```python
+from unittest.mock import Mock
+
+def test_parent_graph_with_mock():
+    """使用 Mock 子图测试父图"""
+
+    # 创建 Mock 子图
+    mock_subgraph = Mock()
+    mock_subgraph.invoke.return_value = {
+        "is_valid": True,
+        "errors": []
+    }
+
+    # 注入 Mock
+    def create_parent_graph_for_test(subgraph):
+        builder = StateGraph(ParentState)
+
+        def use_subgraph(state):
+            result = subgraph.invoke(state)
+            return {"validation_result": result["is_valid"]}
+
+        builder.add_node("validate", use_subgraph)
+        # ...
+        return builder.compile()
+
+    graph = create_parent_graph_for_test(mock_subgraph)
+
+    result = graph.invoke({"user_input": "test"})
+
+    # 验证 Mock 被调用
+    mock_subgraph.invoke.assert_called_once()
+```
+
+**小结**
+
+子图与模块化的最佳实践:
+- ✅ 使用子图将复杂图分解为逻辑模块
+- ✅ 每个子图遵循单一职责原则
+- ✅ 明确定义子图的输入输出状态
+- ✅ 使用适配器模式处理状态映射
+- ✅ 子图错误向上传播,父图统一处理
+- ✅ 独立测试每个子图,提高测试覆盖率
+- ✅ 使用依赖注入增强子图的可测试性
+
+通过合理使用子图,可以构建大规模、易维护的 Agent 应用。
+
+---
+
+### 第 11 章:实战案例 - 智能项目管理助手完整实现
+
+#### 11.1 需求分析
+
+**业务场景**
+
+我们要构建一个智能项目管理助手,能够:
+
+1. **需求理解**: 理解用户的自然语言需求描述
+2. **任务分解**: 将需求分解为具体的可执行任务
+3. **资源分配**: 根据团队成员的能力和负载分配任务
+4. **进度跟踪**: 跟踪任务进度,识别风险
+5. **智能调整**: 根据实际情况调整计划
+6. **人机协作**: 关键决策点需要人工确认
+
+**功能需求**
+
+| 功能 | 描述 | 优先级 |
+|------|------|--------|
+| 需求解析 | 从自然语言提取结构化需求 | P0 |
+| 任务分解 | 生成任务列表和依赖关系 | P0 |
+| 资源分配 | 智能分配任务给团队成员 | P0 |
+| 风险评估 | 识别潜在风险 | P1 |
+| 人工审批 | 重大决策需要人工确认 | P1 |
+| 进度跟踪 | 更新任务状态 | P2 |
+| 计划调整 | 根据变化重新规划 | P2 |
+
+**技术需求**
+
+- **状态管理**: 持久化项目状态,支持跨会话
+- **错误处理**: 优雅处理 LLM 调用失败、解析错误等
+- **可观测性**: 记录执行日志,便于调试
+- **可扩展性**: 易于添加新功能
+
+#### 11.2 架构设计
+
+**图结构设计**
+
+```
+用户输入
+   ↓
+需求解析
+   ↓
+任务分解
+   ↓
+风险评估 → [高风险?] → 人工审批 → 继续
+   ↓                         ↓
+  [低风险]                   ↓
+   ↓                         ↓
+资源分配 ← ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+   ↓
+生成计划
+   ↓
+[需要调整?] → 重新分配 → 资源分配
+   ↓
+输出计划
+```
+
+**状态设计**
+
+```python
+from typing import TypedDict, List, Literal
+
+class Task(TypedDict):
+    """任务结构"""
+    id: str
+    name: str
+    description: str
+    estimated_hours: float
+    dependencies: List[str]
+    assigned_to: str
+    status: Literal["pending", "in_progress", "completed"]
+
+class TeamMember(TypedDict):
+    """团队成员"""
+    name: str
+    skills: List[str]
+    current_load: float  # 当前负载(小时)
+
+class Risk(TypedDict):
+    """风险"""
+    level: Literal["low", "medium", "high"]
+    description: str
+    mitigation: str
+
+class ProjectState(TypedDict):
+    """项目状态"""
+    # 输入
+    user_requirement: str
+
+    # 中间结果
+    parsed_requirements: List[dict]
+    tasks: List[Task]
+    risks: List[Risk]
+    team_members: List[TeamMember]
+
+    # 控制流
+    needs_approval: bool
+    approval_status: Literal["pending", "approved", "rejected"]
+    needs_reallocation: bool
+
+    # 输出
+    project_plan: str
+    messages: List[str]  # 日志消息
+```
+
+#### 11.3 完整实现
+
+```python
+from typing import TypedDict, List, Literal, Annotated
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+import json
+
+# ============= 状态定义 =============
+
+class Task(TypedDict):
+    id: str
+    name: str
+    description: str
+    estimated_hours: float
+    dependencies: List[str]
+    assigned_to: str
+    status: Literal["pending", "in_progress", "completed"]
+
+class TeamMember(TypedDict):
+    name: str
+    skills: List[str]
+    current_load: float
+
+class Risk(TypedDict):
+    level: Literal["low", "medium", "high"]
+    description: str
+    mitigation: str
+
+class ProjectState(TypedDict):
+    user_requirement: str
+    parsed_requirements: List[dict]
+    tasks: List[Task]
+    risks: List[Risk]
+    team_members: List[TeamMember]
+    needs_approval: bool
+    approval_status: Literal["pending", "approved", "rejected", ""]
+    needs_reallocation: bool
+    project_plan: str
+    messages: Annotated[List[str], "append"]  # 使用 append reducer
+
+# ============= 工具函数 =============
+
+def log_message(state: ProjectState, message: str) -> dict:
+    """添加日志消息"""
+    return {"messages": [f"[LOG] {message}"]}
+
+# ============= 节点实现 =============
+
+def parse_requirements(state: ProjectState) -> dict:
+    """解析需求"""
+    requirement = state["user_requirement"]
+
+    # 简化版本:实际应该调用 LLM
+    # llm_response = llm.invoke(f"解析以下需求:\n{requirement}")
+
+    parsed = [
+        {
+            "id": "REQ-001",
+            "description": requirement,
+            "priority": "high",
+            "estimated_complexity": "medium"
+        }
+    ]
+
+    return {
+        "parsed_requirements": parsed,
+        "messages": ["需求解析完成"]
+    }
+
+def decompose_tasks(state: ProjectState) -> dict:
+    """任务分解"""
+    requirements = state["parsed_requirements"]
+
+    # 简化版本:实际应该调用 LLM
+    tasks: List[Task] = []
+
+    for req in requirements:
+        # 根据需求生成任务
+        base_tasks = [
+            {
+                "id": f"TASK-{len(tasks) + 1:03d}",
+                "name": f"设计 {req['description']}",
+                "description": "完成设计文档",
+                "estimated_hours": 8.0,
+                "dependencies": [],
+                "assigned_to": "",
+                "status": "pending"
+            },
+            {
+                "id": f"TASK-{len(tasks) + 2:03d}",
+                "name": f"实现 {req['description']}",
+                "description": "编码实现",
+                "estimated_hours": 16.0,
+                "dependencies": [f"TASK-{len(tasks) + 1:03d}"],
+                "assigned_to": "",
+                "status": "pending"
+            },
+            {
+                "id": f"TASK-{len(tasks) + 3:03d}",
+                "name": f"测试 {req['description']}",
+                "description": "编写和执行测试",
+                "estimated_hours": 8.0,
+                "dependencies": [f"TASK-{len(tasks) + 2:03d}"],
+                "assigned_to": "",
+                "status": "pending"
+            }
+        ]
+
+        tasks.extend(base_tasks)
+
+    return {
+        "tasks": tasks,
+        "messages": [f"任务分解完成,共 {len(tasks)} 个任务"]
+    }
+
+def assess_risks(state: ProjectState) -> dict:
+    """风险评估"""
+    tasks = state["tasks"]
+
+    risks: List[Risk] = []
+
+    # 简单规则:超过 20 小时的任务标记为高风险
+    total_hours = sum(t["estimated_hours"] for t in tasks)
+
+    if total_hours > 40:
+        risks.append({
+            "level": "high",
+            "description": f"项目总工时 {total_hours} 小时,可能超出预期",
+            "mitigation": "建议分阶段交付"
+        })
+    elif total_hours > 20:
+        risks.append({
+            "level": "medium",
+            "description": f"项目总工时 {total_hours} 小时,需要关注进度",
+            "mitigation": "每周进行进度检查"
+        })
+    else:
+        risks.append({
+            "level": "low",
+            "description": "项目规模适中",
+            "mitigation": "按正常流程执行"
+        })
+
+    # 判断是否需要审批
+    needs_approval = any(r["level"] == "high" for r in risks)
+
+    return {
+        "risks": risks,
+        "needs_approval": needs_approval,
+        "messages": [f"风险评估完成,风险等级: {risks[0]['level']}"]
+    }
+
+def allocate_resources(state: ProjectState) -> dict:
+    """资源分配"""
+    tasks = state["tasks"]
+    team_members = state.get("team_members", [])
+
+    # 如果没有团队成员,使用默认团队
+    if not team_members:
+        team_members = [
+            {
+                "name": "Alice",
+                "skills": ["backend", "database"],
+                "current_load": 0.0
+            },
+            {
+                "name": "Bob",
+                "skills": ["frontend", "ui"],
+                "current_load": 0.0
+            },
+            {
+                "name": "Charlie",
+                "skills": ["testing", "qa"],
+                "current_load": 0.0
+            }
+        ]
+
+    # 简单的负载均衡分配
+    allocated_tasks = []
+    member_loads = {m["name"]: m["current_load"] for m in team_members}
+
+    for task in tasks:
+        # 找到负载最少的成员
+        assigned_member = min(member_loads.items(), key=lambda x: x[1])[0]
+
+        # 分配任务
+        allocated_task = {**task, "assigned_to": assigned_member}
+        allocated_tasks.append(allocated_task)
+
+        # 更新负载
+        member_loads[assigned_member] += task["estimated_hours"]
+
+    # 检查是否需要重新分配
+    max_load = max(member_loads.values())
+    min_load = min(member_loads.values())
+    needs_reallocation = (max_load - min_load) > 20  # 负载差超过 20 小时
+
+    return {
+        "tasks": allocated_tasks,
+        "team_members": [
+            {**m, "current_load": member_loads[m["name"]]}
+            for m in team_members
+        ],
+        "needs_reallocation": needs_reallocation,
+        "messages": ["资源分配完成"]
+    }
+
+def generate_plan(state: ProjectState) -> dict:
+    """生成项目计划"""
+    tasks = state["tasks"]
+    risks = state["risks"]
+    team_members = state["team_members"]
+
+    plan_lines = ["# 项目计划\n"]
+
+    # 需求概述
+    plan_lines.append("## 需求")
+    plan_lines.append(f"{state['user_requirement']}\n")
+
+    # 任务列表
+    plan_lines.append("## 任务列表\n")
+    for task in tasks:
+        deps = ", ".join(task["dependencies"]) if task["dependencies"] else "无"
+        plan_lines.append(
+            f"- **{task['name']}** "
+            f"({task['estimated_hours']}h) "
+            f"-> {task['assigned_to']} "
+            f"[依赖: {deps}]"
+        )
+
+    # 团队负载
+    plan_lines.append("\n## 团队负载\n")
+    for member in team_members:
+        plan_lines.append(f"- {member['name']}: {member['current_load']}h")
+
+    # 风险
+    plan_lines.append("\n## 风险评估\n")
+    for risk in risks:
+        plan_lines.append(
+            f"- [{risk['level'].upper()}] {risk['description']}\n"
+            f"  缓解措施: {risk['mitigation']}"
+        )
+
+    project_plan = "\n".join(plan_lines)
+
+    return {
+        "project_plan": project_plan,
+        "messages": ["项目计划生成完成"]
+    }
+
+# ============= 条件判断 =============
+
+def check_approval_needed(state: ProjectState) -> str:
+    """检查是否需要审批"""
+    if state["needs_approval"]:
+        return "request_approval"
+    return "allocate"
+
+def check_approval_status(state: ProjectState) -> str:
+    """检查审批状态"""
+    status = state.get("approval_status", "")
+
+    if status == "approved":
+        return "continue"
+    elif status == "rejected":
+        return "end"
+    else:
+        # 等待审批
+        return "wait"
+
+def check_reallocation_needed(state: ProjectState) -> str:
+    """检查是否需要重新分配"""
+    if state.get("needs_reallocation", False):
+        return "reallocate"
+    return "generate"
+
+# ============= 人机交互节点 =============
+
+def request_approval(state: ProjectState) -> dict:
+    """请求人工审批"""
+    return {
+        "approval_status": "pending",
+        "messages": ["等待人工审批..."]
+    }
+
+# ============= 构建图 =============
+
+def create_project_management_graph():
+    """创建项目管理图"""
+    builder = StateGraph(ProjectState)
+
+    # 添加节点
+    builder.add_node("parse", parse_requirements)
+    builder.add_node("decompose", decompose_tasks)
+    builder.add_node("assess_risks", assess_risks)
+    builder.add_node("request_approval", request_approval)
+    builder.add_node("allocate", allocate_resources)
+    builder.add_node("generate", generate_plan)
+
+    # 设置入口
+    builder.set_entry_point("parse")
+
+    # 添加边
+    builder.add_edge("parse", "decompose")
+    builder.add_edge("decompose", "assess_risks")
+
+    # 条件分支:是否需要审批
+    builder.add_conditional_edges(
+        "assess_risks",
+        check_approval_needed,
+        {
+            "request_approval": "request_approval",
+            "allocate": "allocate"
+        }
+    )
+
+    # 审批后继续
+    builder.add_edge("request_approval", "allocate")
+
+    # 条件分支:是否需要重新分配
+    builder.add_conditional_edges(
+        "allocate",
+        check_reallocation_needed,
+        {
+            "reallocate": "allocate",  # 循环
+            "generate": "generate"
+        }
+    )
+
+    # 结束
+    builder.set_finish_point("generate")
+
+    # 添加持久化
+    conn = sqlite3.connect(":memory:")  # 使用内存数据库
+    checkpointer = SqliteSaver(conn)
+
+    return builder.compile(checkpointer=checkpointer)
+
+# ============= 使用示例 =============
+
+def run_example():
+    """运行示例"""
+    graph = create_project_management_graph()
+
+    # 初始输入
+    initial_state = {
+        "user_requirement": "开发一个用户认证系统,包括登录、注册、密码重置功能",
+        "parsed_requirements": [],
+        "tasks": [],
+        "risks": [],
+        "team_members": [],
+        "needs_approval": False,
+        "approval_status": "",
+        "needs_reallocation": False,
+        "project_plan": "",
+        "messages": []
+    }
+
+    # 配置
+    config = {"configurable": {"thread_id": "project-001"}}
+
+    # 执行
+    result = graph.invoke(initial_state, config=config)
+
+    # 打印结果
+    print("=== 执行日志 ===")
+    for msg in result["messages"]:
+        print(msg)
+
+    print("\n=== 项目计划 ===")
+    print(result["project_plan"])
+
+    # 如果需要审批
+    if result["needs_approval"] and result["approval_status"] == "pending":
+        print("\n=== 需要人工审批 ===")
+        print("请审批此项目计划(approve/reject):")
+
+        # 模拟人工审批
+        approval = "approve"  # 实际应该等待用户输入
+
+        # 继续执行
+        updated_state = {
+            **result,
+            "approval_status": "approved"
+        }
+
+        result = graph.invoke(updated_state, config=config)
+
+        print("\n=== 审批后的计划 ===")
+        print(result["project_plan"])
+
+if __name__ == "__main__":
+    run_example()
+```
+
+#### 11.4 功能增强
+
+##### 11.4.1 集成真实的 LLM
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+
+def parse_requirements_with_llm(state: ProjectState) -> dict:
+    """使用 LLM 解析需求"""
+    requirement = state["user_requirement"]
+
+    messages = [
+        SystemMessage(content="""你是一个项目管理专家。
+将用户需求解析为结构化的需求列表。
+
+输出 JSON 格式:
+[
+  {
+    "id": "REQ-001",
+    "description": "需求描述",
+    "priority": "high/medium/low",
+    "estimated_complexity": "high/medium/low"
+  }
+]
+"""),
+        HumanMessage(content=requirement)
+    ]
+
+    response = llm.invoke(messages)
+
+    # 解析 LLM 输出
+    try:
+        parsed = json.loads(response.content)
+        return {
+            "parsed_requirements": parsed,
+            "messages": ["需求解析完成"]
+        }
+    except json.JSONDecodeError:
+        return {
+            "parsed_requirements": [],
+            "messages": ["需求解析失败,请重新描述需求"]
+        }
+
+def decompose_tasks_with_llm(state: ProjectState) -> dict:
+    """使用 LLM 分解任务"""
+    requirements = state["parsed_requirements"]
+
+    messages = [
+        SystemMessage(content="""你是一个项目管理专家。
+将需求分解为具体的任务,包括任务名称、描述、预计工时和依赖关系。
+
+输出 JSON 格式:
+[
+  {
+    "id": "TASK-001",
+    "name": "任务名称",
+    "description": "详细描述",
+    "estimated_hours": 8.0,
+    "dependencies": [],
+    "assigned_to": "",
+    "status": "pending"
+  }
+]
+"""),
+        HumanMessage(content=json.dumps(requirements, ensure_ascii=False))
+    ]
+
+    response = llm.invoke(messages)
+
+    try:
+        tasks = json.loads(response.content)
+        return {
+            "tasks": tasks,
+            "messages": [f"任务分解完成,共 {len(tasks)} 个任务"]
+        }
+    except json.JSONDecodeError:
+        return {
+            "tasks": [],
+            "messages": ["任务分解失败"]
+        }
+```
+
+##### 11.4.2 添加重试机制
+
+```python
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10)
+)
+def parse_requirements_with_retry(state: ProjectState) -> dict:
+    """带重试的需求解析"""
+    return parse_requirements_with_llm(state)
+
+def parse_requirements_robust(state: ProjectState) -> dict:
+    """健壮的需求解析"""
+    try:
+        return parse_requirements_with_retry(state)
+    except Exception as e:
+        # 重试失败后的降级处理
+        return {
+            "parsed_requirements": [],
+            "messages": [f"需求解析失败: {str(e)}"]
+        }
+```
+
+##### 11.4.3 添加流式输出
+
+```python
+def run_with_streaming():
+    """流式输出执行过程"""
+    graph = create_project_management_graph()
+
+    initial_state = {
+        "user_requirement": "开发用户认证系统",
+        "parsed_requirements": [],
+        "tasks": [],
+        "risks": [],
+        "team_members": [],
+        "needs_approval": False,
+        "approval_status": "",
+        "needs_reallocation": False,
+        "project_plan": "",
+        "messages": []
+    }
+
+    config = {"configurable": {"thread_id": "project-001"}}
+
+    # 流式执行
+    for event in graph.stream(initial_state, config=config):
+        # event 是一个字典: {node_name: state_update}
+        for node, state_update in event.items():
+            print(f"\n[{node}]")
+
+            # 打印日志消息
+            if "messages" in state_update:
+                for msg in state_update["messages"]:
+                    print(f"  {msg}")
+```
+
+#### 11.5 测试
+
+##### 11.5.1 单元测试
+
+```python
+import pytest
+
+def test_parse_requirements():
+    """测试需求解析"""
+    state = {
+        "user_requirement": "开发登录功能",
+        "parsed_requirements": [],
+        "messages": []
+    }
+
+    result = parse_requirements(state)
+
+    assert len(result["parsed_requirements"]) > 0
+    assert result["parsed_requirements"][0]["id"].startswith("REQ-")
+
+def test_decompose_tasks():
+    """测试任务分解"""
+    state = {
+        "parsed_requirements": [
+            {
+                "id": "REQ-001",
+                "description": "登录功能",
+                "priority": "high",
+                "estimated_complexity": "medium"
+            }
+        ],
+        "tasks": [],
+        "messages": []
+    }
+
+    result = decompose_tasks(state)
+
+    assert len(result["tasks"]) > 0
+    assert all(t["id"].startswith("TASK-") for t in result["tasks"])
+
+def test_assess_risks():
+    """测试风险评估"""
+    # 高风险场景
+    state = {
+        "tasks": [
+            {"estimated_hours": 50.0}
+        ],
+        "risks": [],
+        "messages": []
+    }
+
+    result = assess_risks(state)
+
+    assert len(result["risks"]) > 0
+    assert result["needs_approval"] == True
+
+    # 低风险场景
+    state["tasks"] = [{"estimated_hours": 10.0}]
+    result = assess_risks(state)
+
+    assert result["needs_approval"] == False
+```
+
+##### 11.5.2 集成测试
+
+```python
+def test_full_workflow():
+    """测试完整工作流"""
+    graph = create_project_management_graph()
+
+    initial_state = {
+        "user_requirement": "开发一个简单的待办事项应用",
+        "parsed_requirements": [],
+        "tasks": [],
+        "risks": [],
+        "team_members": [],
+        "needs_approval": False,
+        "approval_status": "",
+        "needs_reallocation": False,
+        "project_plan": "",
+        "messages": []
+    }
+
+    config = {"configurable": {"thread_id": "test-001"}}
+
+    result = graph.invoke(initial_state, config=config)
+
+    # 验证输出
+    assert result["project_plan"] != ""
+    assert len(result["tasks"]) > 0
+    assert len(result["risks"]) > 0
+    assert all(t["assigned_to"] != "" for t in result["tasks"])
+```
+
+#### 11.6 部署建议
+
+##### 11.6.1 生产环境配置
+
+```python
+import os
+from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
+
+def create_production_graph():
+    """创建生产环境的图"""
+    # 使用 PostgreSQL
+    conn = psycopg.connect(os.getenv("DATABASE_URL"))
+    checkpointer = PostgresSaver(conn)
+
+    builder = StateGraph(ProjectState)
+    # ... 添加节点
+
+    return builder.compile(
+        checkpointer=checkpointer,
+        # 启用调试
+        debug=False
+    )
+```
+
+##### 11.6.2 API 封装
+
+```python
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class ProjectRequest(BaseModel):
+    requirement: str
+    thread_id: str
+
+class ProjectResponse(BaseModel):
+    project_plan: str
+    status: str
+    needs_approval: bool
+
+@app.post("/projects", response_model=ProjectResponse)
+async def create_project(request: ProjectRequest):
+    """创建项目"""
+    graph = create_production_graph()
+
+    initial_state = {
+        "user_requirement": request.requirement,
+        "parsed_requirements": [],
+        "tasks": [],
+        "risks": [],
+        "team_members": [],
+        "needs_approval": False,
+        "approval_status": "",
+        "needs_reallocation": False,
+        "project_plan": "",
+        "messages": []
+    }
+
+    config = {"configurable": {"thread_id": request.thread_id}}
+
+    result = graph.invoke(initial_state, config=config)
+
+    return ProjectResponse(
+        project_plan=result["project_plan"],
+        status="completed",
+        needs_approval=result["needs_approval"]
+    )
+
+@app.post("/projects/{thread_id}/approve")
+async def approve_project(thread_id: str, approved: bool):
+    """审批项目"""
+    graph = create_production_graph()
+
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # 获取当前状态
+    current_state = graph.get_state(config)
+
+    # 更新审批状态
+    updated_state = {
+        **current_state.values,
+        "approval_status": "approved" if approved else "rejected"
+    }
+
+    # 继续执行
+    result = graph.invoke(updated_state, config=config)
+
+    return {"status": "success", "project_plan": result["project_plan"]}
+```
+
+**小结**
+
+这个完整的实战案例展示了:
+- ✅ 如何设计复杂的状态结构
+- ✅ 如何组合多个节点实现业务逻辑
+- ✅ 如何实现条件分支和循环
+- ✅ 如何集成 LLM 和工具
+- ✅ 如何处理人机交互
+- ✅ 如何添加错误处理和重试
+- ✅ 如何进行测试
+- ✅ 如何部署到生产环境
+
+通过这个案例,你应该能够独立构建复杂的 LangGraph 应用。
+
+---
+### 第 12 章:架构设计模式
+
+#### 12.1 职责划分原则
+
+**核心思想**
+
+在构建复杂的 LangGraph 应用时,合理的职责划分是关键。
+
+**单一职责原则(SRP)**
+
+每个节点应该只做一件事情,且做好这件事情。
+
+**反面案例**:
+
+```python
+def god_node(state: State) -> dict:
+    """一个节点做所有事情"""
+    # 调用 LLM
+    llm_response = llm.invoke(state["input"])
+    
+    # 解析输出
+    parsed = json.loads(llm_response.content)
+    
+    # 验证数据
+    if not validate(parsed):
+        raise ValueError("Invalid data")
+    
+    # 存储到数据库
+    db.save(parsed)
+    
+    # 发送通知
+    send_email(parsed)
+    
+    # 生成报告
+    report = generate_report(parsed)
+    
+    return {"result": report}
+```
+
+问题:
+- 职责不清晰
+- 难以测试
+- 难以复用
+- 错误处理复杂
+
+**正确案例**:
+
+```python
+def call_llm(state: State) -> dict:
+    """职责:调用 LLM"""
+    response = llm.invoke(state["input"])
+    return {"llm_output": response.content}
+
+def parse_output(state: State) -> dict:
+    """职责:解析输出"""
+    try:
+        parsed = json.loads(state["llm_output"])
+        return {"parsed_data": parsed, "parse_error": ""}
+    except json.JSONDecodeError as e:
+        return {"parsed_data": None, "parse_error": str(e)}
+
+def validate_data(state: State) -> dict:
+    """职责:验证数据"""
+    data = state["parsed_data"]
+    errors = []
+    
+    if not data:
+        errors.append("数据为空")
+    
+    return {"validation_errors": errors}
+```
+
+优势:
+- 每个节点职责单一
+- 易于测试和复用
+- 错误处理清晰
+- 可以灵活组合
+
+**关注点分离(Separation of Concerns)**
+
+不同类型的逻辑应该分离到不同的节点或子图。
+
+**层次划分**:
+
+| 层次 | 职责 | 示例节点 |
+|------|------|----------|
+| **业务逻辑层** | 实现核心业务规则 | 需求分析、任务分解 |
+| **数据处理层** | 数据转换、验证 | 解析、验证、格式化 |
+| **集成层** | 与外部系统交互 | 调用 LLM、查询数据库、调用 API |
+| **控制流层** | 决策和路由 | 条件判断、循环控制 |
+
+#### 12.2 图结构模式
+
+##### 12.2.1 模式1:线性流水线
+
+**适用场景**: 简单的顺序处理流程
+
+```
+输入 → 步骤1 → 步骤2 → 步骤3 → 输出
+```
+
+**实现**:
+
+```python
+builder.set_entry_point("step1")
+builder.add_edge("step1", "step2")
+builder.add_edge("step2", "step3")
+builder.set_finish_point("step3")
+```
+
+**优点**:
+- 简单易懂
+- 容易调试
+- 执行路径确定
+
+**缺点**:
+- 缺乏灵活性
+- 无法处理异常分支
+- 无法迭代优化
+
+##### 12.2.2 模式2:条件分支
+
+**适用场景**: 根据条件选择不同的处理路径
+
+```
+输入 → 分类器 → [类型A] → 处理A → 输出
+                ↓
+              [类型B] → 处理B → 输出
+                ↓
+              [类型C] → 处理C → 输出
+```
+
+##### 12.2.3 模式3:循环迭代
+
+**适用场景**: 需要反复优化的场景
+
+```
+输入 → 生成 → 评估 → [不满意] → 改进 → 生成
+                 ↓
+               [满意]
+                 ↓
+               输出
+```
+
+**最佳实践**:
+
+```python
+def should_continue_safe(state: State) -> str:
+    """安全的循环判断"""
+    # 1. 硬性限制迭代次数
+    if state["iteration"] >= MAX_ITERATIONS:
+        return "finish"
+    
+    # 2. 检查是否有改进
+    if state["iteration"] > 0:
+        improvement = state["current_score"] - state["previous_score"]
+        if improvement < 0.01:  # 改进不明显
+            return "finish"
+    
+    # 3. 达到质量要求
+    if state["current_score"] >= TARGET_SCORE:
+        return "finish"
+    
+    return "continue"
+```
+
+#### 12.3 状态设计模式
+
+##### 12.3.1 模式1:最小化状态
+
+**原则**: 只保留必要的状态,避免冗余
+
+**正确案例**:
+
+```python
+class State(TypedDict):
+    # 输入
+    user_input: str
+    
+    # 关键中间状态
+    current_stage: Literal["parsing", "processing", "finalizing"]
+    intermediate_result: dict  # 只保留最新的中间结果
+    
+    # 输出
+    final_result: str
+    
+    # 元数据
+    metadata: dict  # 可选的调试信息
+```
+
+##### 12.3.2 模式2:结构化状态
+
+**正确案例**:
+
+```python
+class User(TypedDict):
+    name: str
+    email: str
+    phone: str
+
+class Task(TypedDict):
+    id: str
+    name: str
+    status: str
+
+class State(TypedDict):
+    user: User
+    task: Task
+    result: dict
+```
+
+#### 12.4 最佳实践总结
+
+**图设计检查清单**:
+- [ ] 是否画出了流程图?
+- [ ] 每个节点是否只有一个职责?
+- [ ] 是否有超过 10 个节点的图?(考虑拆分子图)
+- [ ] 是否有死循环的风险?
+- [ ] 是否为每个节点编写了文档?
+
+**状态设计检查清单**:
+- [ ] 状态是否使用了 TypedDict?
+- [ ] 是否有不必要的冗余字段?
+- [ ] 状态序列化后是否小于 1MB?
+- [ ] 字段名是否清晰?
+
+**小结**
+
+架构设计模式的核心原则:
+- ✅ 单一职责,关注点分离
+- ✅ 根据场景选择合适的图结构模式
+- ✅ 设计清晰、最小化的状态
+- ✅ 使用检查清单避免常见错误
+
+---
+
+### 第 13 章:性能优化策略
+
+#### 13.1 性能瓶颈分析
+
+**常见瓶颈**
+
+| 瓶颈类型 | 表现 | 占比 |
+|---------|------|------|
+| **LLM 调用延迟** | 单次调用 1-10 秒 | 60-80% |
+| **网络 I/O** | API 调用、数据库查询 | 10-20% |
+| **状态序列化** | 检查点保存/加载 | 5-10% |
+| **计算密集** | 数据处理、解析 | 5-10% |
+
+**性能测量**
+
+```python
+import time
+from functools import wraps
+
+def measure_time(func):
+    """测量节点执行时间"""
+    @wraps(func)
+    def wrapper(state):
+        start = time.time()
+        result = func(state)
+        elapsed = time.time() - start
+        
+        print(f"[PERF] {func.__name__}: {elapsed:.2f}s")
+        
+        return result
+    
+    return wrapper
+
+@measure_time
+def slow_node(state: State) -> dict:
+    """慢节点"""
+    result = expensive_operation(state["data"])
+    return {"data": result}
+```
+
+#### 13.2 并行化优化
+
+##### 13.2.1 使用并行节点
+
+**并行版本(快)**:
+
+```python
+from langgraph.constants import Send
+
+def fan_out(state: State):
+    """启动并行任务"""
+    return [
+        Send("task_a", state),
+        Send("task_b", state),
+        Send("task_c", state)
+    ]
+
+# 构建图
+builder.add_node("fan_out", fan_out)
+builder.add_node("task_a", task_a)
+builder.add_node("task_b", task_b)
+builder.add_node("task_c", task_c)
+builder.add_node("aggregate", aggregate_results)
+
+builder.set_entry_point("fan_out")
+builder.add_edge("task_a", "aggregate")
+builder.add_edge("task_b", "aggregate")
+builder.add_edge("task_c", "aggregate")
+```
+
+**性能提升**: 串行 6 秒 → 并行 2 秒 = 3x
+
+##### 13.2.2 批量处理
+
+**批量处理(快)**:
+
+```python
+def process_items_in_batch(state: State) -> dict:
+    """批量处理"""
+    items = state["items"]
+    
+    # 一次性发送所有项目
+    batch_prompt = "批量处理以下项目:\n" + "\n".join(
+        f"{i+1}. {item}" for i, item in enumerate(items)
+    )
+    
+    result = llm.invoke(batch_prompt)
+    results = parse_batch_result(result)
+    
+    return {"results": results}
+```
+
+**性能提升**: 逐个 10 秒 → 批量 2 秒 = 5x
+
+#### 13.3 LLM 调用优化
+
+##### 13.3.1 减少不必要的 LLM 调用
+
+**策略1:使用缓存**
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=100)
+def call_llm_cached(prompt: str) -> str:
+    """缓存 LLM 结果"""
+    response = llm.invoke(prompt)
+    return response.content
+```
+
+**策略2:条件调用**
+
+```python
+def conditional_llm_call(state: State) -> dict:
+    """只在必要时调用 LLM"""
+    # 先尝试规则引擎
+    rule_result = apply_rules(state["input"])
+    
+    if rule_result.confidence > 0.9:
+        return {"result": rule_result.value, "method": "rule"}
+    
+    # 规则不确定,使用 LLM
+    llm_result = llm.invoke(state["input"])
+    return {"result": llm_result.content, "method": "llm"}
+```
+
+##### 13.3.2 使用更快的模型
+
+| 任务复杂度 | 推荐模型 | 速度 | 成本 |
+|-----------|---------|------|------|
+| 简单分类 | gpt-3.5-turbo | 快 | 低 |
+| 一般任务 | gpt-4-turbo | 中 | 中 |
+| 复杂推理 | gpt-4 | 慢 | 高 |
+
+##### 13.3.3 优化 Prompt
+
+```python
+# ✅ 简洁的 Prompt
+short_prompt = """
+Analyze and summarize:
+
+{text}
+"""
+```
+
+**性能提升**:
+- Token 数量减少 50%
+- 响应时间减少 30%
+- 成本降低 50%
+
+#### 13.4 状态管理优化
+
+##### 13.4.1 减少检查点频率
+
+```python
+class State(TypedDict):
+    data: dict
+    checkpoint_flag: bool  # 标记是否需要保存
+```
+
+##### 13.4.2 状态压缩
+
+```python
+def cleanup_state(state: State) -> dict:
+    """清理状态中的临时数据"""
+    cleaned_state = {
+        k: v for k, v in state.items()
+        if not k.startswith("_temp")
+    }
+    return cleaned_state
+```
+
+##### 13.4.3 选择合适的 Checkpointer
+
+| Checkpointer | 写入速度 | 读取速度 | 适用场景 |
+|-------------|---------|---------|---------|
+| InMemorySaver | 极快 | 极快 | 开发/测试 |
+| SqliteSaver | 快 | 快 | 单机应用 |
+| PostgresSaver | 中 | 中 | 生产环境 |
+
+#### 13.5 最佳实践
+
+**性能优化检查清单**:
+
+**并行化**:
+- [ ] 是否识别了可以并行的任务?
+- [ ] 是否使用了 Send API?
+
+**LLM 优化**:
+- [ ] 是否使用了合适的模型?
+- [ ] 是否缓存了重复的调用?
+- [ ] 是否优化了 Prompt 长度?
+- [ ] 是否使用了批量处理?
+
+**状态管理**:
+- [ ] 状态是否最小化?
+- [ ] 是否使用了合适的 Checkpointer?
+
+**小结**
+
+性能优化的核心策略:
+- ✅ 测量优先:先测量,再优化
+- ✅ 并行化:利用并行节点和异步执行
+- ✅ LLM 优化:选择合适的模型,优化 Prompt
+- ✅ 状态管理:最小化状态,控制检查点
+
+记住:过早优化是万恶之源。先保证正确性,再优化性能。
+
+---
+
+### 第 14 章:错误处理与可靠性
+
+#### 14.1 错误分类
+
+**LangGraph 应用中的常见错误**
+
+| 错误类型 | 原因 | 示例 | 严重程度 |
+|---------|------|------|---------|
+| **LLM 调用失败** | 网络问题、API 限流 | OpenAI API 超时 | 高 |
+| **解析错误** | LLM 输出格式不符 | JSON 解析失败 | 中 |
+| **数据验证失败** | 输入不符合要求 | 缺少必填字段 | 中 |
+| **业务逻辑错误** | 违反业务规则 | 任务依赖循环 | 低 |
+| **资源不足** | 内存、数据库连接 | 数据库连接池耗尽 | 高 |
+
+#### 14.2 节点级错误处理
+
+##### 14.2.1 基本错误捕获
+
+```python
+from typing import TypedDict, Optional
+
+class State(TypedDict):
+    data: dict
+    error: Optional[str]
+    error_node: Optional[str]
+
+def safe_node(state: State) -> dict:
+    """安全的节点实现"""
+    try:
+        result = risky_operation(state["data"])
+        return {"data": result, "error": None}
+    except ValueError as e:
+        return {
+            "error": f"数据验证失败: {str(e)}",
+            "error_node": "safe_node"
+        }
+    except Exception as e:
+        return {
+            "error": f"未知错误: {str(e)}",
+            "error_node": "safe_node"
+        }
+```
+
+##### 14.2.2 重试机制
+
+**策略1:使用 tenacity 库**
+
+```python
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type
+)
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((TimeoutError, ConnectionError))
+)
+def call_external_api(data: dict) -> dict:
+    """调用外部 API,自动重试"""
+    response = requests.post("https://api.example.com", json=data)
+    response.raise_for_status()
+    return response.json()
+```
+
+##### 14.2.3 降级策略
+
+```python
+def node_with_fallback(state: State) -> dict:
+    """带降级的节点"""
+    try:
+        # 首选:使用 LLM
+        result = llm.invoke(state["prompt"])
+        return {"result": result.content, "method": "llm"}
+    except Exception as llm_error:
+        try:
+            # 降级:使用规则引擎
+            result = rule_based_processor(state["prompt"])
+            return {"result": result, "method": "rule"}
+        except Exception:
+            # 最终降级:返回默认值
+            return {
+                "result": "抱歉,暂时无法处理您的请求",
+                "method": "default"
+            }
+```
+
+#### 14.3 图级错误处理
+
+##### 14.3.1 错误状态传播
+
+```python
+from typing import List
+
+class Error(TypedDict):
+    """错误详情"""
+    node: str
+    type: str
+    message: str
+    timestamp: str
+
+class State(TypedDict):
+    data: dict
+    errors: Annotated[List[Error], "append"]
+    has_fatal_error: bool
+
+def error_router(state: State) -> str:
+    """错误路由"""
+    if state.get("has_fatal_error", False):
+        return "handle_fatal_error"
+    
+    if len(state.get("errors", [])) > 0:
+        return "handle_error"
+    
+    return "continue"
+```
+
+#### 14.4 LLM 调用的错误处理
+
+##### 14.4.1 处理 API 限流
+
+```python
+from tenacity import retry, wait_random_exponential, stop_after_attempt
+
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(5)
+)
+def call_llm_with_rate_limit_handling(prompt: str) -> str:
+    """处理限流的 LLM 调用"""
+    try:
+        response = llm.invoke(prompt)
+        return response.content
+    except RateLimitError as e:
+        print(f"遇到限流,等待后重试: {e}")
+        raise  # 触发重试
+```
+
+##### 14.4.2 处理解析错误
+
+```python
+from pydantic import BaseModel, ValidationError
+import json
+
+def parse_llm_output_safe(state: State) -> dict:
+    """安全解析 LLM 输出"""
+    llm_output = state["llm_output"]
+    
+    try:
+        parsed = json.loads(llm_output)
+        return {"tasks": parsed, "error": None}
+    except json.JSONDecodeError as e:
+        return {"tasks": [], "error": f"JSON 解析失败: {e}"}
+    except ValidationError as e:
+        return {"tasks": [], "error": f"数据验证失败: {e}"}
+```
+
+#### 14.5 可观测性
+
+##### 14.5.1 结构化日志
+
+```python
+import logging
+import json
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def instrumented_node(state: State) -> dict:
+    """带日志的节点"""
+    logger.info(f"开始执行 instrumented_node")
+    
+    try:
+        result = process(state["data"])
+        return {"data": result}
+    except Exception as e:
+        logger.error(f"节点执行失败: {e}", exc_info=True)
+        raise
+```
+
+#### 14.6 最佳实践
+
+**错误处理检查清单**:
+
+**节点级**:
+- [ ] 是否捕获了所有可能的异常?
+- [ ] 是否实现了重试机制?
+- [ ] 是否有降级方案?
+
+**图级**:
+- [ ] 是否在状态中传播错误信息?
+- [ ] 是否有全局错误处理器?
+- [ ] 是否记录了错误日志?
+
+**可观测性**:
+- [ ] 是否添加了结构化日志?
+- [ ] 是否收集了性能指标?
+
+**小结**
+
+错误处理与可靠性的核心原则:
+- ✅ 分层处理:节点级、图级、应用级
+- ✅ 失败快速:不可恢复的错误快速失败
+- ✅ 重试机制:处理瞬时错误
+- ✅ 降级策略:保证基本功能可用
+- ✅ 可观测性:日志、追踪、指标
+
+记住:错误处理不是可选的,是必须的。
+
+---
+### 第 15 章:测试与调试
+
+#### 15.1 测试策略
+
+**测试金字塔**
+
+```
+       /\
+      /  \  E2E Tests (少量)
+     /────\
+    /      \ Integration Tests (适量)
+   /────────\
+  /          \ Unit Tests (大量)
+ /────────────\
+```
+
+**测试层次**
+
+| 层次 | 目标 | 工具 | 比例 |
+|------|------|------|------|
+| **单元测试** | 测试单个节点 | pytest | 70% |
+| **集成测试** | 测试子图或完整图 | pytest + mock | 20% |
+| **端到端测试** | 测试完整工作流 | pytest + 真实依赖 | 10% |
+
+#### 15.2 单元测试
+
+##### 15.2.1 测试单个节点
+
+**基本节点测试**
+
+```python
+import pytest
+
+def test_parse_requirement_node():
+    """测试需求解析节点"""
+    # 准备输入
+    state = {
+        "user_requirement": "开发登录功能",
+        "parsed_requirements": [],
+        "messages": []
+    }
+    
+    # 执行节点
+    result = parse_requirements(state)
+    
+    # 验证输出
+    assert "parsed_requirements" in result
+    assert len(result["parsed_requirements"]) > 0
+    assert result["parsed_requirements"][0]["id"].startswith("REQ-")
+
+def test_parse_requirement_node_empty_input():
+    """测试空输入"""
+    state = {
+        "user_requirement": "",
+        "parsed_requirements": [],
+        "messages": []
+    }
+    
+    result = parse_requirements(state)
+    
+    # 验证错误处理
+    assert len(result["parsed_requirements"]) == 0
+    # 或者抛出异常
+```
+
+**带错误处理的节点测试**
+
+```python
+def test_risky_node_success():
+    """测试成功场景"""
+    state = {"data": {"value": 10}}
+    
+    result = risky_node(state)
+    
+    assert result["error"] is None
+    assert "data" in result
+
+def test_risky_node_failure():
+    """测试失败场景"""
+    state = {"data": {"value": -1}}  # 无效输入
+    
+    result = risky_node(state)
+    
+    assert result["error"] is not None
+    assert "error_node" in result
+```
+
+**使用参数化测试**
+
+```python
+@pytest.mark.parametrize("input_value,expected_output", [
+    ("简单需求", 1),
+    ("复杂需求,包含多个功能", 2),
+    ("", 0),
+])
+def test_parse_requirements_parametrized(input_value, expected_output):
+    """参数化测试"""
+    state = {
+        "user_requirement": input_value,
+        "parsed_requirements": [],
+        "messages": []
+    }
+    
+    result = parse_requirements(state)
+    
+    assert len(result["parsed_requirements"]) == expected_output
+```
+
+##### 15.2.2 测试条件函数
+
+```python
+def test_should_continue_finish():
+    """测试终止条件"""
+    state = {
+        "iteration": 5,
+        "quality_score": 0.95
+    }
+    
+    result = should_continue(state)
+    
+    assert result == "finish"
+
+def test_should_continue_continue():
+    """测试继续条件"""
+    state = {
+        "iteration": 1,
+        "quality_score": 0.5
+    }
+    
+    result = should_continue(state)
+    
+    assert result == "improve"
+```
+
+##### 15.2.3 使用 Fixtures
+
+```python
+@pytest.fixture
+def sample_state():
+    """创建示例状态"""
+    return {
+        "user_input": "测试输入",
+        "data": {},
+        "messages": []
+    }
+
+@pytest.fixture
+def mock_llm(monkeypatch):
+    """Mock LLM"""
+    def mock_invoke(prompt):
+        class MockResponse:
+            content = '{"tasks": ["task1", "task2"]}'
+        return MockResponse()
+    
+    monkeypatch.setattr("module.llm.invoke", mock_invoke)
+
+def test_node_with_mock_llm(sample_state, mock_llm):
+    """使用 fixture 的测试"""
+    result = llm_node(sample_state)
+    
+    assert "tasks" in result
+```
+
+#### 15.3 集成测试
+
+##### 15.3.1 测试子图
+
+```python
+def test_validation_subgraph():
+    """测试验证子图"""
+    graph = create_validation_subgraph()
+    
+    # 测试有效输入
+    result = graph.invoke({
+        "content": "这是一段有效的内容",
+        "is_valid": False,
+        "errors": []
+    })
+    
+    assert result["is_valid"] == True
+    assert len(result["errors"]) == 0
+    
+    # 测试无效输入
+    result = graph.invoke({
+        "content": "",
+        "is_valid": False,
+        "errors": []
+    })
+    
+    assert result["is_valid"] == False
+    assert len(result["errors"]) > 0
+```
+
+##### 15.3.2 测试完整图
+
+```python
+def test_full_graph_happy_path():
+    """测试完整图的正常流程"""
+    graph = create_project_management_graph()
+    
+    initial_state = {
+        "user_requirement": "开发一个简单功能",
+        "parsed_requirements": [],
+        "tasks": [],
+        "risks": [],
+        "team_members": [],
+        "needs_approval": False,
+        "approval_status": "",
+        "needs_reallocation": False,
+        "project_plan": "",
+        "messages": []
+    }
+    
+    config = {"configurable": {"thread_id": "test-001"}}
+    
+    result = graph.invoke(initial_state, config=config)
+    
+    # 验证最终状态
+    assert result["project_plan"] != ""
+    assert len(result["tasks"]) > 0
+    assert all(t["assigned_to"] != "" for t in result["tasks"])
+
+def test_full_graph_with_approval():
+    """测试需要审批的流程"""
+    graph = create_project_management_graph()
+    
+    # 构造高风险场景
+    initial_state = {
+        "user_requirement": "开发一个超大型系统",  # 会触发高风险
+        # ... 其他字段
+    }
+    
+    config = {"configurable": {"thread_id": "test-002"}}
+    
+    # 第一次执行:到审批点
+    result = graph.invoke(initial_state, config=config)
+    
+    assert result["needs_approval"] == True
+    assert result["approval_status"] == "pending"
+    
+    # 模拟人工审批
+    updated_state = {**result, "approval_status": "approved"}
+    
+    # 第二次执行:审批后继续
+    final_result = graph.invoke(updated_state, config=config)
+    
+    assert final_result["project_plan"] != ""
+```
+
+##### 15.3.3 使用 Mock 依赖
+
+```python
+from unittest.mock import Mock, patch
+
+def test_graph_with_mock_llm():
+    """使用 Mock LLM 测试图"""
+    
+    # Mock LLM 响应
+    mock_llm = Mock()
+    mock_llm.invoke.return_value = Mock(
+        content='{"requirements": [{"id": "REQ-001", "description": "test"}]}'
+    )
+    
+    with patch('module.llm', mock_llm):
+        graph = create_project_management_graph()
+        
+        result = graph.invoke(initial_state, config=config)
+        
+        # 验证 LLM 被调用
+        assert mock_llm.invoke.called
+        
+        # 验证结果
+        assert len(result["parsed_requirements"]) > 0
+
+def test_graph_with_mock_db():
+    """使用 Mock 数据库测试图"""
+    
+    mock_db = Mock()
+    mock_db.query.return_value = [
+        {"name": "Alice", "skills": ["backend"]},
+        {"name": "Bob", "skills": ["frontend"]}
+    ]
+    
+    with patch('module.db', mock_db):
+        graph = create_project_management_graph()
+        
+        result = graph.invoke(initial_state, config=config)
+        
+        # 验证数据库被查询
+        assert mock_db.query.called
+```
+
+#### 15.4 端到端测试
+
+```python
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def test_e2e_with_real_dependencies():
+    """端到端测试,使用真实依赖"""
+    
+    # 使用真实的 checkpointer
+    conn = sqlite3.connect(":memory:")
+    checkpointer = SqliteSaver(conn)
+    
+    graph = create_project_management_graph_with_checkpointer(checkpointer)
+    
+    # 执行完整流程
+    initial_state = {
+        "user_requirement": "开发用户认证系统",
+        # ... 所有字段
+    }
+    
+    config = {"configurable": {"thread_id": "e2e-test-001"}}
+    
+    # 执行
+    result = graph.invoke(initial_state, config=config)
+    
+    # 验证结果
+    assert result["project_plan"] != ""
+    assert len(result["tasks"]) > 0
+    
+    # 验证持久化
+    saved_state = graph.get_state(config)
+    assert saved_state.values["project_plan"] == result["project_plan"]
+```
+
+#### 15.5 调试技巧
+
+##### 15.5.1 使用流式输出调试
+
+```python
+def debug_with_streaming():
+    """使用流式输出调试"""
+    graph = create_graph()
+    
+    print("=== 执行流程 ===")
+    
+    for event in graph.stream(initial_state, config=config):
+        # event 是 {node_name: state_update}
+        for node_name, state_update in event.items():
+            print(f"\n[执行节点: {node_name}]")
+            print(f"状态更新: {state_update.keys()}")
+            
+            # 打印关键信息
+            if "error" in state_update and state_update["error"]:
+                print(f"❌ 错误: {state_update['error']}")
+            
+            if "messages" in state_update:
+                for msg in state_update["messages"]:
+                    print(f"  📝 {msg}")
+```
+
+##### 15.5.2 检查状态历史
+
+```python
+def debug_with_state_history():
+    """检查状态历史"""
+    graph = create_graph()
+    
+    config = {"configurable": {"thread_id": "debug-001"}}
+    
+    # 执行
+    result = graph.invoke(initial_state, config=config)
+    
+    # 查看历史
+    print("\n=== 状态历史 ===")
+    history = graph.get_state_history(config)
+    
+    for i, checkpoint in enumerate(history):
+        print(f"\n检查点 {i}:")
+        print(f"  节点: {checkpoint.metadata.get('source', 'unknown')}")
+        print(f"  时间: {checkpoint.metadata.get('ts', 'unknown')}")
+        print(f"  状态: {checkpoint.values.keys()}")
+```
+
+##### 15.5.3 使用调试节点
+
+```python
+def create_debug_node(label: str):
+    """创建调试节点"""
+    def debug_node(state: State) -> dict:
+        print(f"\n=== DEBUG: {label} ===")
+        print(f"当前状态:")
+        for key, value in state.items():
+            if key.startswith("_"):
+                continue  # 跳过私有字段
+            
+            if isinstance(value, (str, int, float, bool)):
+                print(f"  {key}: {value}")
+            elif isinstance(value, list):
+                print(f"  {key}: [{len(value)} items]")
+            else:
+                print(f"  {key}: {type(value).__name__}")
+        
+        return {}  # 不修改状态
+    
+    return debug_node
+
+# 在图中插入调试节点
+builder.add_node("debug_after_parse", create_debug_node("解析后"))
+builder.add_edge("parse", "debug_after_parse")
+builder.add_edge("debug_after_parse", "decompose")
+```
+
+##### 15.5.4 断点调试
+
+```python
+import pdb
+
+def node_with_breakpoint(state: State) -> dict:
+    """带断点的节点"""
+    
+    # 在特定条件下设置断点
+    if state.get("debug_mode", False):
+        pdb.set_trace()
+    
+    result = process(state["data"])
+    
+    return {"data": result}
+```
+
+#### 15.6 常见问题排查
+
+##### 15.6.1 问题:状态更新不生效
+
+**症状**: 节点返回了更新,但状态没有变化
+
+**原因**: 使用了错误的 reducer 或返回了空字典
+
+**排查步骤**:
+
+```python
+def test_state_update():
+    """测试状态更新"""
+    
+    # 检查节点返回值
+    state = {"data": "old"}
+    result = my_node(state)
+    
+    print(f"节点返回: {result}")
+    
+    # 验证返回值不为空
+    assert result != {}
+    assert "data" in result
+    
+    # 验证返回值与输入不同
+    assert result["data"] != state["data"]
+```
+
+**解决方案**:
+
+```python
+# ❌ 错误:返回空字典
+def bad_node(state: State) -> dict:
+    state["data"] = "new"  # 直接修改状态
+    return {}  # 返回空字典
+
+# ✅ 正确:返回更新
+def good_node(state: State) -> dict:
+    return {"data": "new"}
+```
+
+##### 15.6.2 问题:图执行卡住
+
+**症状**: 图执行到某个节点后不继续
+
+**原因**: 
+1. 条件边的条件函数返回了未定义的边
+2. 节点抛出了未捕获的异常
+3. 在等待人工输入
+
+**排查步骤**:
+
+```python
+def debug_stuck_graph():
+    """调试卡住的图"""
+    graph = create_graph()
+    
+    # 使用流式输出查看执行到哪里
+    for event in graph.stream(initial_state, config=config):
+        node_name = list(event.keys())[0]
+        print(f"执行: {node_name}")
+    
+    # 如果没有打印,说明在第一个节点就卡住了
+```
+
+**解决方案**:
+
+```python
+# 检查条件函数
+def check_condition_function():
+    """测试条件函数"""
+    state = {"status": "unknown"}
+    
+    result = route_by_status(state)
+    
+    # 验证返回值是有效的边名称
+    assert result in ["continue", "error", "end"]
+
+# 添加默认边
+builder.add_conditional_edges(
+    "router",
+    route_by_status,
+    {
+        "continue": "next_node",
+        "error": "error_handler"
+    }
+    # ❌ 缺少 "end" 的映射
+)
+
+# ✅ 正确:添加所有可能的映射
+builder.add_conditional_edges(
+    "router",
+    route_by_status,
+    {
+        "continue": "next_node",
+        "error": "error_handler",
+        "end": END
+    }
+)
+```
+
+##### 15.6.3 问题:循环次数超出预期
+
+**症状**: 循环节点执行了太多次
+
+**原因**: 终止条件不正确
+
+**排查步骤**:
+
+```python
+def test_loop_termination():
+    """测试循环终止"""
+    state = {
+        "iteration": 0,
+        "quality_score": 0.5
+    }
+    
+    max_iterations = 10
+    
+    for i in range(max_iterations):
+        decision = should_continue(state)
+        
+        print(f"迭代 {i}: decision={decision}")
+        
+        if decision == "finish":
+            print(f"在第 {i} 次迭代终止")
+            break
+        
+        # 模拟状态更新
+        state["iteration"] += 1
+        state["quality_score"] += 0.1
+    else:
+        print(f"警告: 达到最大迭代次数 {max_iterations}")
+```
+
+**解决方案**:
+
+```python
+def should_continue_safe(state: State) -> str:
+    """安全的循环条件"""
+    # 1. 硬性限制
+    if state["iteration"] >= 10:
+        return "finish"
+    
+    # 2. 质量检查
+    if state["quality_score"] >= 0.9:
+        return "finish"
+    
+    # 3. 改进检查
+    if state["iteration"] > 0:
+        improvement = state["current_score"] - state["previous_score"]
+        if improvement < 0.01:
+            return "finish"
+    
+    return "continue"
+```
+
+##### 15.6.4 问题:LLM 输出解析失败
+
+**症状**: JSON 解析总是失败
+
+**原因**: LLM 输出格式不稳定
+
+**排查步骤**:
+
+```python
+def debug_llm_output():
+    """调试 LLM 输出"""
+    state = {"prompt": "生成任务列表"}
+    
+    # 多次调用,查看输出稳定性
+    for i in range(5):
+        response = llm.invoke(state["prompt"])
+        print(f"\n尝试 {i+1}:")
+        print(response.content)
+        
+        try:
+            parsed = json.loads(response.content)
+            print("✅ 解析成功")
+        except json.JSONDecodeError as e:
+            print(f"❌ 解析失败: {e}")
+```
+
+**解决方案**:
+
+```python
+# 1. 改进 Prompt
+prompt = """
+生成任务列表,**必须**输出有效的 JSON 格式:
+
+```json
+{
+  "tasks": [
+    {"id": "1", "name": "任务1"},
+    {"id": "2", "name": "任务2"}
+  ]
+}
+```
+
+不要输出任何其他内容。
+"""
+
+# 2. 使用结构化输出
+from langchain_core.output_parsers import JsonOutputParser
+
+parser = JsonOutputParser()
+
+prompt_with_instructions = f"""
+{task_description}
+
+{parser.get_format_instructions()}
+"""
+
+# 3. 清理 LLM 输出
+def clean_llm_output(output: str) -> str:
+    """清理 LLM 输出"""
+    # 移除 markdown 代码块
+    output = output.strip()
+    if output.startswith("```json"):
+        output = output[7:]
+    if output.startswith("```"):
+        output = output[3:]
+    if output.endswith("```"):
+        output = output[:-3]
+    
+    return output.strip()
+```
+
+#### 15.7 测试最佳实践
+
+**测试检查清单**:
+
+**单元测试**:
+- [ ] 每个节点都有测试?
+- [ ] 测试了成功和失败场景?
+- [ ] 使用了参数化测试?
+- [ ] 测试了边界条件?
+
+**集成测试**:
+- [ ] 测试了子图?
+- [ ] 测试了完整图?
+- [ ] 使用了 Mock 依赖?
+- [ ] 测试了人机交互流程?
+
+**调试**:
+- [ ] 使用了流式输出?
+- [ ] 检查了状态历史?
+- [ ] 添加了调试日志?
+
+**持续集成**:
+- [ ] 测试在 CI 中自动运行?
+- [ ] 测试覆盖率达标?(建议 >80%)
+- [ ] 有性能基准测试?
+
+**小结**
+
+测试与调试的核心原则:
+- ✅ 测试金字塔:大量单元测试,适量集成测试,少量 E2E 测试
+- ✅ Mock 依赖:隔离测试,提高速度
+- ✅ 流式调试:查看执行流程
+- ✅ 状态历史:回溯问题
+- ✅ 结构化日志:记录关键信息
+
+记住:好的测试是最好的文档。
+
+---
+
+## 结语
+
+### 学习路径建议
+
+**初学者(第 1-2 周)**:
+1. 阅读第 1-3 章,理解核心概念
+2. 跟随第 4 章快速上手,运行示例代码
+3. 完成第 5 章的贯穿案例
+
+**进阶者(第 3-4 周)**:
+4. 深入学习第 6-9 章的高级特性
+5. 理解第 10 章的模块化设计
+6. 参考第 11 章实现自己的项目
+
+**专家级(持续学习)**:
+7. 掌握第 12-15 章的最佳实践
+8. 优化性能和可靠性
+9. 贡献开源,分享经验
+
+### 进一步学习资源
+
+**官方资源**:
+- [LangGraph 官方文档](https://langchain-ai.github.io/langgraph/)
+- [LangGraph GitHub](https://github.com/langchain-ai/langgraph)
+- [LangChain 文档](https://python.langchain.com/)
+
+**社区资源**:
+- [LangChain Discord](https://discord.gg/langchain)
+- [LangChain Twitter](https://twitter.com/langchainai)
+- [LangGraph 示例库](https://github.com/langchain-ai/langgraph/tree/main/examples)
+
+**相关技术**:
+- Prompt Engineering
+- RAG (Retrieval-Augmented Generation)
+- Fine-tuning LLMs
+- Vector Databases
+
+### 常见问题 FAQ
+
+**Q: LangGraph 和 LangChain 的关系?**
+
+A: LangGraph 是 LangChain 生态系统的一部分,专注于构建有状态的、循环的 Agent 工作流。LangChain 提供了更高层的抽象(如 Chain、Agent),而 LangGraph 提供了更底层的控制。
+
+**Q: 什么时候应该使用 LangGraph?**
+
+A: 当你需要:
+- 复杂的条件分支
+- 循环和迭代
+- 人机交互
+- 长时间运行的工作流
+- 跨会话的状态持久化
+
+**Q: LangGraph 的性能如何?**
+
+A: 性能主要取决于:
+- LLM 调用次数(最大瓶颈)
+- 状态大小(影响序列化)
+- Checkpointer 选择(影响持久化速度)
+
+通过并行化、缓存、批量处理等优化可以显著提升性能。
+
+**Q: 如何处理成本问题?**
+
+A: 
+- 减少不必要的 LLM 调用
+- 使用更便宜的模型(如 gpt-3.5-turbo)
+- 优化 Prompt 长度
+- 使用缓存
+- 添加规则引擎降级
+
+**Q: LangGraph 适合生产环境吗?**
+
+A: 是的。但需要:
+- 使用 PostgresSaver 持久化
+- 添加完善的错误处理
+- 实现监控和告警
+- 进行充分的测试
+- 考虑成本和性能
+
+### 致谢
+
+感谢 LangChain 团队创建了如此优秀的框架。
+
+感谢所有为本指南提供反馈和建议的读者。
+
+希望这份指南能帮助你构建出色的 AI Agent 应用!
+
+---
+
+**版本**: v1.0
+**最后更新**: 2026-02
+**作者**: Claude Code
+**许可**: MIT
+
