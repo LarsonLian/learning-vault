@@ -3339,3 +3339,608 @@ def execute_with_undo(state: State) -> dict:
 人机协作让 Agent 更可控、更可信,是生产环境的必备能力。
 
 ---
+
+### 第 9 章:持久化与恢复 - 长时间运行的 Agent
+
+持久化(Persistence)让 Agent 能够跨会话保存状态,支持长时间运行的任务、系统故障恢复、以及强大的调试能力。
+
+#### 9.1 概念讲解
+
+##### 9.1.1 Checkpointer 抽象层
+
+**什么是 Checkpointer**
+
+Checkpointer 是 LangGraph 的持久化抽象层,负责:
+- 在每个节点执行后保存状态
+- 提供状态查询和恢复接口
+- 支持多线程/多用户的独立会话
+
+**基本接口**
+
+```python
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
+class MyCheckpointer(BaseCheckpointSaver):
+    def put(self, config, checkpoint, metadata):
+        """保存检查点"""
+        pass
+
+    def get(self, config):
+        """获取最新检查点"""
+        pass
+
+    def list(self, config):
+        """列出所有检查点"""
+        pass
+```
+
+**内置 Checkpointer 实现**
+
+| 类型 | 适用场景 | 优点 | 缺点 |
+|------|---------|------|------|
+| **MemorySaver** | 开发、测试、演示 | 简单快速,无依赖 | 进程重启后丢失 |
+| **SqliteSaver** | 单机应用、原型 | 持久化,无需外部服务 | 不支持分布式 |
+| **PostgresSaver** | 生产环境 | 持久化,支持分布式 | 需要数据库服务 |
+
+**使用 Checkpointer**
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+
+# 开发环境:内存
+checkpointer = InMemorySaver()
+
+# 生产环境:SQLite
+conn = sqlite3.connect("checkpoints.db")
+checkpointer = SqliteSaver(conn)
+
+# 编译时指定
+graph = builder.compile(checkpointer=checkpointer)
+
+# 执行时提供 thread_id
+config = {"configurable": {"thread_id": "user_123"}}
+result = graph.invoke(input_data, config=config)
+```
+
+##### 9.1.2 执行历史记录
+
+**检查点的内容**
+
+每个检查点包含:
+1. **完整状态**: 当前所有状态字段的值
+2. **元数据**: 节点名、时间戳、父检查点ID
+3. **配置**: thread_id 等配置信息
+
+**查看执行历史**
+
+```python
+# 获取指定线程的所有检查点
+history = list(graph.get_state_history(config))
+
+for checkpoint in history:
+    print(f"步骤: {checkpoint.metadata['step']}")
+    print(f"节点: {checkpoint.metadata['source']}")
+    print(f"状态: {checkpoint.values}")
+    print(f"时间: {checkpoint.metadata['ts']}")
+    print("---")
+
+# 输出示例:
+# 步骤: 3
+# 节点: analyze
+# 状态: {"messages": [...], "score": 0.8}
+# 时间: 2024-03-15T10:30:00
+```
+
+**检查点的层次结构**
+
+```
+checkpoint_0 (初始状态)
+  ↓
+checkpoint_1 (执行 node_a 后)
+  ↓
+checkpoint_2 (执行 node_b 后)
+  ↓
+checkpoint_3 (执行 node_c 后)
+  ↓
+checkpoint_4 (END)
+```
+
+##### 9.1.3 时间旅行调试
+
+**时间旅行(Time Travel)**允许你:
+- 回到任意历史检查点查看状态
+- 从过去的状态重新执行
+- 修改历史状态并查看影响
+
+**查看历史状态**
+
+```python
+# 获取所有检查点
+checkpoints = list(graph.get_state_history(config))
+
+# 查看第2步的状态
+step_2 = checkpoints[2]
+print(f"第2步状态: {step_2.values}")
+
+# 查看特定检查点
+checkpoint_id = "specific_checkpoint_id"
+state = graph.get_state({"checkpoint_id": checkpoint_id})
+print(f"检查点状态: {state.values}")
+```
+
+**从历史状态恢复执行**
+
+```python
+# 从第2步重新执行
+step_2_config = checkpoints[2].config
+
+# 继续执行(使用第2步的状态)
+result = graph.invoke(None, config=step_2_config)
+# 会从第2步之后的节点继续
+```
+
+**修改历史并重新执行**
+
+```python
+# 获取第2步的检查点
+step_2 = checkpoints[2]
+
+# 修改状态
+graph.update_state(
+    step_2.config,
+    {"score": 0.9}  # 修改某个字段
+)
+
+# 从修改后的状态继续执行
+result = graph.invoke(None, config=step_2.config)
+# 会使用修改后的状态继续
+```
+
+#### 9.2 实战片段:多天跨度的项目管理流程
+
+让我们构建一个支持长时间运行的项目管理工作流:
+
+```python
+from typing import Annotated, Literal, TypedDict
+from operator import add
+from datetime import datetime
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+
+# 状态定义
+class ProjectState(TypedDict):
+    project_id: str
+    phase: Literal["planning", "development", "testing", "deployment"]
+    tasks: Annotated[list[dict], add]
+    current_day: int
+    total_days: int
+    logs: Annotated[list[str], add]
+
+# 节点1:规划阶段
+def planning_phase(state: ProjectState) -> dict:
+    """项目规划"""
+    log = f"Day {state['current_day']}: 完成项目规划"
+    print(log)
+
+    tasks = [
+        {"id": 1, "name": "需求分析", "status": "completed"},
+        {"id": 2, "name": "架构设计", "status": "completed"}
+    ]
+
+    return {
+        "phase": "development",
+        "tasks": tasks,
+        "current_day": state["current_day"] + 1,
+        "logs": [log]
+    }
+
+# 节点2:开发阶段
+def development_phase(state: ProjectState) -> dict:
+    """开发阶段(可能跨多天)"""
+    day = state["current_day"]
+    log = f"Day {day}: 开发进行中..."
+    print(log)
+
+    new_tasks = [
+        {"id": 3, "name": "前端开发", "status": "in_progress"},
+        {"id": 4, "name": "后端开发", "status": "in_progress"}
+    ]
+
+    # 模拟多天开发
+    if day < 5:
+        # 继续开发
+        return {
+            "current_day": day + 1,
+            "logs": [log]
+        }
+    else:
+        # 开发完成,进入测试
+        return {
+            "phase": "testing",
+            "tasks": new_tasks,
+            "current_day": day + 1,
+            "logs": [log + " (开发完成)"]
+        }
+
+# 节点3:测试阶段
+def testing_phase(state: ProjectState) -> dict:
+    """测试阶段"""
+    log = f"Day {state['current_day']}: 执行测试"
+    print(log)
+
+    return {
+        "phase": "deployment",
+        "current_day": state["current_day"] + 1,
+        "logs": [log]
+    }
+
+# 节点4:部署阶段
+def deployment_phase(state: ProjectState) -> dict:
+    """部署阶段"""
+    log = f"Day {state['current_day']}: 项目已部署"
+    print(log)
+
+    return {
+        "current_day": state["current_day"] + 1,
+        "logs": [log]
+    }
+
+# 路由函数
+def route_by_phase(state: ProjectState) -> str:
+    """根据当前阶段路由"""
+    phase = state["phase"]
+
+    if phase == "planning":
+        return "planning"
+    elif phase == "development":
+        return "development"
+    elif phase == "testing":
+        return "testing"
+    elif phase == "deployment":
+        return "deployment"
+    else:
+        return END
+
+# 开发阶段路由
+def route_development(state: ProjectState) -> str:
+    """开发阶段内部路由"""
+    if state["current_day"] < 5:
+        return "development"  # 继续开发
+    else:
+        return "next_phase"   # 进入下一阶段
+
+# 构建图
+builder = StateGraph(ProjectState)
+
+# 添加节点
+builder.add_node("planning", planning_phase)
+builder.add_node("development", development_phase)
+builder.add_node("testing", testing_phase)
+builder.add_node("deployment", deployment_phase)
+
+# 添加边
+builder.add_edge(START, "planning")
+
+# 从 planning 到 development
+builder.add_edge("planning", "development")
+
+# development 内部循环或进入 testing
+builder.add_conditional_edges(
+    "development",
+    route_development,
+    {
+        "development": "development",  # 循环
+        "next_phase": "testing"
+    }
+)
+
+builder.add_edge("testing", "deployment")
+builder.add_edge("deployment", END)
+
+# 使用 SQLite 持久化
+conn = sqlite3.connect("project.db", check_same_thread=False)
+checkpointer = SqliteSaver(conn)
+graph = builder.compile(checkpointer=checkpointer)
+
+# ========== 模拟多天执行 ==========
+
+config = {"configurable": {"thread_id": "project_001"}}
+
+# Day 1: 开始项目
+print("=== Day 1: 启动项目 ===")
+result = graph.invoke({
+    "project_id": "project_001",
+    "phase": "planning",
+    "tasks": [],
+    "current_day": 1,
+    "total_days": 10,
+    "logs": []
+}, config=config)
+
+print(f"\n当前阶段: {result['phase']}")
+print(f"当前天数: {result['current_day']}\n")
+
+# Day 2-3: 继续执行(模拟系统重启)
+print("=== Days 2-3: 系统重启,从检查点恢复 ===")
+for day in range(2):
+    result = graph.invoke(None, config=config)  # None 表示继续
+    print(f"当前阶段: {result['phase']}, Day: {result['current_day']}")
+
+# 查看执行历史
+print("\n=== 执行历史 ===")
+history = list(graph.get_state_history(config))
+print(f"总共 {len(history)} 个检查点")
+
+for i, checkpoint in enumerate(history[:5]):  # 只显示前5个
+    print(f"\n检查点 {i}:")
+    print(f"  阶段: {checkpoint.values.get('phase', 'N/A')}")
+    print(f"  天数: {checkpoint.values.get('current_day', 'N/A')}")
+    print(f"  源节点: {checkpoint.metadata.get('source', 'N/A')}")
+
+# 时间旅行:回到 Day 2
+print("\n=== 时间旅行:回到 Day 2 ===")
+day_2_checkpoint = [c for c in history if c.values.get("current_day") == 2][0]
+state_at_day_2 = graph.get_state(day_2_checkpoint.config)
+print(f"Day 2 状态: 阶段={state_at_day_2.values['phase']}, 任务数={len(state_at_day_2.values['tasks'])}")
+
+# 从 Day 2 重新执行
+print("\n从 Day 2 重新执行...")
+result = graph.invoke(None, config=day_2_checkpoint.config)
+print(f"重新执行后: {result['phase']}, Day {result['current_day']}")
+```
+
+**执行流程**
+
+```
+Day 1:
+  START → planning → development (Day 2)
+  ↓ 保存检查点
+
+Day 2 (系统重启):
+  从检查点恢复 → development → development (Day 3)
+  ↓ 保存检查点
+
+Day 3:
+  从检查点恢复 → development → development (Day 4)
+  ↓ 保存检查点
+
+... (继续执行)
+
+时间旅行:
+  回到 Day 2 的检查点
+  从 Day 2 重新执行
+  可以看到不同的执行路径
+```
+
+#### 9.3 最佳实践
+
+##### 9.3.1 存储后端选择
+
+**原则**:根据应用需求选择合适的存储后端
+
+**场景1:开发和测试**
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+# ✅ 优点:
+# - 无需配置
+# - 速度快
+# - 适合快速迭代
+
+# ❌ 缺点:
+# - 进程重启后丢失
+# - 不支持多进程
+
+checkpointer = InMemorySaver()
+```
+
+**场景2:单机应用**
+
+```python
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+
+# ✅ 优点:
+# - 持久化
+# - 无需外部服务
+# - 适合中小型应用
+
+# ❌ 缺点:
+# - 不支持分布式
+# - 并发性能有限
+
+conn = sqlite3.connect("app.db")
+checkpointer = SqliteSaver(conn)
+```
+
+**场景3:生产环境/分布式系统**
+
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
+
+# ✅ 优点:
+# - 持久化
+# - 支持分布式
+# - 高并发性能
+# - 支持备份和复制
+
+# ❌ 缺点:
+# - 需要 PostgreSQL 服务
+# - 配置相对复杂
+
+conn = psycopg.connect("postgresql://user:pass@host:5432/db")
+checkpointer = PostgresSaver(conn)
+```
+
+**存储后端对比**
+
+| 特性 | InMemorySaver | SqliteSaver | PostgresSaver |
+|------|--------------|-------------|---------------|
+| 持久化 | ❌ | ✅ | ✅ |
+| 分布式 | ❌ | ❌ | ✅ |
+| 性能 | 极快 | 快 | 快 |
+| 并发 | 低 | 中 | 高 |
+| 运维成本 | 无 | 低 | 中 |
+
+##### 9.3.2 检查点粒度控制
+
+**原则**:不是所有状态更新都需要保存检查点
+
+**策略1:只在关键节点保存**
+
+```python
+# 只在重要节点后保存检查点
+graph = builder.compile(
+    checkpointer=checkpointer,
+    # 注意:LangGraph 默认在每个节点后都保存
+    # 如果要减少检查点,可以在状态中添加标志
+)
+
+def expensive_node(state: State) -> dict:
+    """耗时的节点"""
+    # 执行大量计算...
+    result = heavy_computation()
+
+    # 明确标记需要保存检查点
+    return {
+        "result": result,
+        "_checkpoint": True  # 自定义标志
+    }
+```
+
+**策略2:采样保存**
+
+```python
+class State(TypedDict):
+    iteration: int
+    data: dict
+    checkpoint_every: int  # 每N次迭代保存
+
+def iterative_node(state: State) -> dict:
+    """迭代节点"""
+    iteration = state["iteration"] + 1
+
+    # 只在特定迭代保存检查点
+    should_checkpoint = (iteration % state["checkpoint_every"] == 0)
+
+    return {
+        "iteration": iteration,
+        "data": process(state["data"]),
+        "_save_checkpoint": should_checkpoint
+    }
+```
+
+**策略3:基于状态大小**
+
+```python
+import sys
+
+def smart_checkpoint(state: State) -> dict:
+    """根据状态大小决定是否保存"""
+    state_size = sys.getsizeof(str(state))
+
+    # 状态太大时跳过检查点
+    if state_size > 1_000_000:  # 1MB
+        return {"_skip_checkpoint": True}
+
+    return {}
+```
+
+##### 9.3.3 状态清理策略
+
+**原则**:避免无限增长的状态历史
+
+**策略1:限制检查点数量**
+
+```python
+# 在应用层实现清理
+def cleanup_old_checkpoints(thread_id: str, keep_latest: int = 10):
+    """保留最新的N个检查点"""
+    config = {"configurable": {"thread_id": thread_id}}
+    history = list(graph.get_state_history(config))
+
+    if len(history) > keep_latest:
+        # 删除旧检查点(伪代码)
+        old_checkpoints = history[keep_latest:]
+        for checkpoint in old_checkpoints:
+            checkpointer.delete(checkpoint.config)
+
+# 定期清理
+cleanup_old_checkpoints("user_123", keep_latest=20)
+```
+
+**策略2:基于时间的清理**
+
+```python
+from datetime import datetime, timedelta
+
+def cleanup_by_age(thread_id: str, max_age_days: int = 7):
+    """删除超过N天的检查点"""
+    config = {"configurable": {"thread_id": thread_id}}
+    history = list(graph.get_state_history(config))
+
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+
+    for checkpoint in history:
+        timestamp = checkpoint.metadata.get("ts")
+        if timestamp < cutoff:
+            checkpointer.delete(checkpoint.config)
+```
+
+**策略3:压缩旧检查点**
+
+```python
+def compress_old_checkpoints(thread_id: str, threshold_days: int = 3):
+    """压缩旧检查点,只保留关键信息"""
+    config = {"configurable": {"thread_id": thread_id}}
+    history = list(graph.get_state_history(config))
+
+    cutoff = datetime.now() - timedelta(days=threshold_days)
+
+    for checkpoint in history:
+        if checkpoint.metadata.get("ts") < cutoff:
+            # 只保留摘要
+            compressed_state = {
+                "summary": summarize(checkpoint.values),
+                "metadata": checkpoint.metadata
+            }
+            checkpointer.update(checkpoint.config, compressed_state)
+```
+
+**数据库层面的优化**
+
+```sql
+-- 为 PostgreSQL 设置自动清理
+CREATE INDEX idx_thread_timestamp ON checkpoints(thread_id, ts);
+
+-- 定期删除旧数据
+DELETE FROM checkpoints
+WHERE ts < NOW() - INTERVAL '30 days';
+
+-- 或者只保留最新N个
+DELETE FROM checkpoints
+WHERE id NOT IN (
+  SELECT id FROM checkpoints
+  WHERE thread_id = 'user_123'
+  ORDER BY ts DESC
+  LIMIT 20
+);
+```
+
+**小结**
+
+持久化与恢复的最佳实践:
+- ✅ 根据场景选择合适的存储后端
+- ✅ 控制检查点粒度,避免过度保存
+- ✅ 定期清理旧检查点,控制存储增长
+- ✅ 利用时间旅行调试复杂问题
+- ✅ 为长时间运行的任务提供可靠性保障
+
+持久化让 Agent 能够跨会话、跨故障运行,是生产级应用的基础设施。
+
+---
