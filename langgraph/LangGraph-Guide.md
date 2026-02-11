@@ -2186,3 +2186,567 @@ builder.add_conditional_edges(
 条件路由让 Agent 能够智能决策,是实现复杂工作流的关键。
 
 ---
+
+### 第 7 章:并行执行 - 提升效率的关键
+
+并行执行允许多个节点同时运行,是提升 Agent 性能的重要手段。LangGraph 原生支持并行执行,让你轻松实现 fan-out/fan-in 模式。
+
+#### 7.1 概念讲解
+
+##### 7.1.1 并行节点执行机制
+
+**什么是并行执行**
+
+```python
+# 串行执行:一个接一个
+node_a → node_b → node_c  # 总时间 = 时间A + 时间B + 时间C
+
+# 并行执行:同时进行
+node_a → [node_b, node_c, node_d] → node_e
+         ↑ 并行执行 ↑
+# 总时间 = 时间A + max(时间B, 时间C, 时间D) + 时间E
+```
+
+**LangGraph 的并行执行模型**
+
+```
+Fan-Out(扇出) → Parallel Execution(并行执行) → Fan-In(扇入)
+
+         node_a
+           ↓
+    ┌──────┼──────┐
+    ↓      ↓      ↓
+  node_b node_c node_d  # 并行执行
+    └──────┼──────┘
+           ↓
+        node_e           # 聚合结果
+```
+
+**如何触发并行执行**
+
+方法1:多条边从同一个节点出发
+
+```python
+builder.add_edge(START, "node_b")
+builder.add_edge(START, "node_c")
+builder.add_edge(START, "node_d")
+# START 后,node_b、node_c、node_d 并行执行
+```
+
+方法2:使用 Send API 动态分发(后面详述)
+
+##### 7.1.2 Send API 详解
+
+**Send API 的作用**
+
+Send 允许在运行时动态创建并行任务,适用于:
+- 任务数量事先不确定
+- 需要对列表中的每个元素执行相同操作
+- Map-Reduce 模式
+
+**基本语法**
+
+```python
+from langgraph.types import Send
+
+def fan_out_node(state: State) -> list[Send]:
+    """动态创建并行任务"""
+    tasks = []
+    for item in state["items"]:
+        # 为每个 item 创建一个任务
+        # Send(目标节点名, 传递给该节点的状态)
+        tasks.append(Send("process_item", {"item": item}))
+    return tasks
+
+# 在图中使用
+builder.add_conditional_edges(
+    "fan_out_node",
+    fan_out_node,  # 返回 Send 列表
+)
+```
+
+**Send 的工作流程**
+
+```
+1. fan_out_node 执行,返回 [Send("process", {"item": 1}),
+                          Send("process", {"item": 2}),
+                          Send("process", {"item": 3})]
+
+2. LangGraph 并行执行:
+   process({"item": 1})  ┐
+   process({"item": 2})  ├─ 并行
+   process({"item": 3})  ┘
+
+3. 所有并行任务完成后,继续后续节点
+```
+
+**完整示例:Map-Reduce 模式**
+
+```python
+from typing import Annotated
+from operator import add
+from langgraph.types import Send
+
+class State(TypedDict):
+    items: list[int]
+    results: Annotated[list[int], add]  # 累加结果
+
+def map_items(state: State) -> list[Send]:
+    """Map:为每个 item 创建并行任务"""
+    return [
+        Send("process_item", {"item": item})
+        for item in state["items"]
+    ]
+
+def process_item(state: dict) -> dict:
+    """处理单个 item"""
+    item = state["item"]
+    result = item * 2  # 简单的处理逻辑
+    return {"results": [result]}
+
+def reduce_results(state: State) -> dict:
+    """Reduce:聚合所有结果"""
+    total = sum(state["results"])
+    return {"final_result": total}
+
+# 构建图
+builder = StateGraph(State)
+builder.add_node("map", map_items)
+builder.add_node("process_item", process_item)  # 会被并行调用多次
+builder.add_node("reduce", reduce_results)
+
+builder.add_edge(START, "map")
+builder.add_conditional_edges("map", map_items)  # 动态并行
+builder.add_edge("process_item", "reduce")  # 所有并行任务完成后执行
+builder.add_edge("reduce", END)
+```
+
+##### 7.1.3 并行结果聚合策略
+
+**策略1:使用 Reducer 自动聚合**
+
+```python
+class State(TypedDict):
+    # 使用 add reducer,自动合并结果
+    results: Annotated[list, add]
+
+def parallel_node_1(state: State) -> dict:
+    return {"results": ["result1"]}
+
+def parallel_node_2(state: State) -> dict:
+    return {"results": ["result2"]}
+
+# 执行后,state["results"] = ["result1", "result2"]
+```
+
+**策略2:专门的聚合节点**
+
+```python
+class State(TypedDict):
+    result_a: str
+    result_b: str
+    result_c: str
+    combined: str
+
+def aggregate(state: State) -> dict:
+    """显式聚合"""
+    combined = f"{state['result_a']} | {state['result_b']} | {state['result_c']}"
+    return {"combined": combined}
+
+# 图结构
+#   [node_a, node_b, node_c] → aggregate
+```
+
+**策略3:条件聚合**
+
+```python
+def smart_aggregate(state: State) -> dict:
+    """根据结果质量选择性聚合"""
+    valid_results = [
+        r for r in state["results"]
+        if r["quality_score"] > 0.7
+    ]
+
+    if len(valid_results) >= 2:
+        return {"final": combine(valid_results)}
+    else:
+        return {"error": "Not enough valid results"}
+```
+
+#### 7.2 实战片段:多任务并行处理
+
+让我们构建一个并行的市场研究助手,同时执行多个研究任务:
+
+```python
+from typing import Annotated, TypedDict
+from operator import add
+from langgraph.types import Send
+from langgraph.graph import StateGraph, START, END
+
+# 状态定义
+class ResearchState(TypedDict):
+    topic: str                              # 研究主题
+    research_tasks: list[str]               # 要执行的研究任务
+    task_results: Annotated[list[dict], add]  # 累加所有任务结果
+    final_report: str                       # 最终报告
+
+# 任务单元状态(用于并行执行)
+class TaskState(TypedDict):
+    task_name: str
+    topic: str
+
+# 节点1:分解研究任务
+def decompose_research(state: ResearchState) -> dict:
+    """将研究分解为多个并行任务"""
+    topic = state["topic"]
+
+    tasks = [
+        "competitor_analysis",    # 竞品分析
+        "market_trends",          # 市场趋势
+        "user_feedback",          # 用户反馈
+        "technical_feasibility"   # 技术可行性
+    ]
+
+    return {"research_tasks": tasks}
+
+# 节点2:动态创建并行任务
+def fan_out_tasks(state: ResearchState) -> list[Send]:
+    """为每个研究任务创建并行执行单元"""
+    return [
+        Send("execute_task", {
+            "task_name": task,
+            "topic": state["topic"]
+        })
+        for task in state["research_tasks"]
+    ]
+
+# 节点3:执行单个任务(会被并行调用)
+def execute_task(state: TaskState) -> dict:
+    """执行单个研究任务"""
+    task_name = state["task_name"]
+    topic = state["topic"]
+
+    # 模拟不同的研究任务
+    if task_name == "competitor_analysis":
+        result = {
+            "task": task_name,
+            "findings": f"分析了 {topic} 领域的主要竞争对手",
+            "data": ["竞品A", "竞品B", "竞品C"]
+        }
+    elif task_name == "market_trends":
+        result = {
+            "task": task_name,
+            "findings": f"{topic} 市场呈上升趋势",
+            "data": ["趋势1", "趋势2"]
+        }
+    elif task_name == "user_feedback":
+        result = {
+            "task": task_name,
+            "findings": f"用户对 {topic} 的反馈积极",
+            "data": ["反馈1", "反馈2"]
+        }
+    else:  # technical_feasibility
+        result = {
+            "task": task_name,
+            "findings": f"{topic} 技术上可行",
+            "data": ["技术点1", "技术点2"]
+        }
+
+    print(f"✓ 完成任务: {task_name}")
+    return {"task_results": [result]}
+
+# 节点4:聚合所有结果
+def aggregate_results(state: ResearchState) -> dict:
+    """将所有并行任务的结果聚合成报告"""
+    results = state["task_results"]
+
+    report = f"# {state['topic']} 研究报告\n\n"
+
+    for result in results:
+        report += f"## {result['task']}\n"
+        report += f"{result['findings']}\n"
+        report += f"数据: {', '.join(result['data'])}\n\n"
+
+    return {"final_report": report}
+
+# 构建图
+builder = StateGraph(ResearchState)
+
+# 添加节点
+builder.add_node("decompose", decompose_research)
+builder.add_node("execute_task", execute_task)  # 会被并行调用
+builder.add_node("aggregate", aggregate_results)
+
+# 添加边
+builder.add_edge(START, "decompose")
+
+# 使用 Send API 实现动态并行
+builder.add_conditional_edges("decompose", fan_out_tasks)
+
+# 所有并行任务完成后,执行聚合
+builder.add_edge("execute_task", "aggregate")
+builder.add_edge("aggregate", END)
+
+# 编译
+graph = builder.compile()
+
+# 执行
+result = graph.invoke({
+    "topic": "AI 代码助手",
+    "research_tasks": [],
+    "task_results": [],
+    "final_report": ""
+})
+
+print("\n" + "="*50)
+print(result["final_report"])
+```
+
+**执行流程**
+
+```
+START
+  ↓
+decompose (分解任务) → research_tasks = [A, B, C, D]
+  ↓
+fan_out_tasks (创建并行任务)
+  ↓
+┌─────────────┬─────────────┬─────────────┬─────────────┐
+│ execute(A)  │ execute(B)  │ execute(C)  │ execute(D)  │ 并行执行
+└─────────────┴─────────────┴─────────────┴─────────────┘
+  │               │               │               │
+  └───────────────┴───────────────┴───────────────┘
+                  ↓
+            aggregate (聚合结果)
+                  ↓
+                 END
+
+最终状态:
+{
+  "topic": "AI 代码助手",
+  "research_tasks": [...],
+  "task_results": [
+    {"task": "competitor_analysis", ...},
+    {"task": "market_trends", ...},
+    {"task": "user_feedback", ...},
+    {"task": "technical_feasibility", ...}
+  ],
+  "final_report": "# AI 代码助手 研究报告\n\n..."
+}
+```
+
+#### 7.3 最佳实践
+
+##### 7.3.1 识别可并行任务的方法
+
+**原则**:并行任务之间应该是独立的,互不依赖
+
+**判断标准**
+
+```
+✅ 可以并行:
+- 任务A的输出不影响任务B的输入
+- 任务之间没有数据依赖
+- 任务之间没有顺序要求
+
+❌ 不能并行:
+- 任务B需要任务A的结果
+- 任务之间有共享的可变状态
+- 任务之间有顺序依赖
+```
+
+**示例:区分可并行和不可并行**
+
+```python
+# ❌ 不能并行:有依赖关系
+def task_flow_with_dependency():
+    # 必须先生成代码,再测试
+    code = generate_code(spec)      # 任务1
+    test_result = run_tests(code)   # 任务2(依赖任务1)
+    # 这两个任务必须串行
+
+# ✅ 可以并行:独立任务
+def task_flow_independent():
+    # 这些可以同时进行
+    competitor_data = analyze_competitors(topic)   # 任务1
+    market_data = research_market(topic)           # 任务2
+    user_data = collect_feedback(topic)            # 任务3
+    # 这三个任务可以并行
+```
+
+**识别并行机会的技巧**
+
+```python
+# 技巧1:多个数据源
+# ✅ 从不同来源获取数据可以并行
+tasks = [
+    fetch_from_database(query),
+    fetch_from_api(endpoint),
+    fetch_from_cache(key)
+]
+
+# 技巧2:相同操作应用于不同数据
+# ✅ Map 操作天然并行
+results = [process(item) for item in items]
+
+# 技巧3:多个独立的 LLM 调用
+# ✅ 不同的 LLM 任务可以并行
+joke = llm.invoke("Write a joke about cats")
+poem = llm.invoke("Write a poem about cats")
+story = llm.invoke("Write a story about cats")
+```
+
+##### 7.3.2 并发控制策略
+
+**原则**:控制并发数量,避免资源耗尽
+
+**问题:无限制并发**
+
+```python
+# ❌ 危险:1000个任务同时执行
+items = range(1000)
+tasks = [Send("process", {"item": i}) for i in items]
+# 可能导致:
+# - 内存耗尽
+# - API 限流
+# - 系统过载
+```
+
+**解决方案1:分批处理**
+
+```python
+def fan_out_with_batching(state: State) -> list[Send]:
+    """分批处理,每批最多10个"""
+    items = state["items"]
+    batch_size = 10
+
+    # 只处理前batch_size个
+    current_batch = items[:batch_size]
+    remaining = items[batch_size:]
+
+    tasks = [
+        Send("process_item", {"item": item})
+        for item in current_batch
+    ]
+
+    # 更新状态,记录剩余任务
+    return tasks + [{"remaining_items": remaining}]
+```
+
+**解决方案2:使用信号量(概念)**
+
+```python
+# 伪代码:限制并发数
+max_concurrent = 5
+semaphore = Semaphore(max_concurrent)
+
+def process_with_limit(item):
+    with semaphore:  # 最多5个同时执行
+        return process(item)
+```
+
+**解决方案3:优先级队列**
+
+```python
+def fan_out_with_priority(state: State) -> list[Send]:
+    """按优先级分配资源"""
+    tasks = state["tasks"]
+
+    # 先处理高优先级任务
+    high_priority = [t for t in tasks if t["priority"] == "high"]
+    low_priority = [t for t in tasks if t["priority"] == "low"]
+
+    # 高优先级任务并行,低优先级任务排队
+    sends = [Send("process", {"task": t}) for t in high_priority[:5]]
+    sends += [{"queued_tasks": low_priority}]
+
+    return sends
+```
+
+##### 7.3.3 部分失败处理
+
+**原则**:并行任务中,部分失败不应导致全部失败
+
+**策略1:收集成功和失败**
+
+```python
+class State(TypedDict):
+    successes: Annotated[list, add]
+    failures: Annotated[list, add]
+
+def resilient_task(state: TaskState) -> dict:
+    """容错的任务执行"""
+    try:
+        result = risky_operation(state["data"])
+        return {"successes": [result]}
+    except Exception as e:
+        return {"failures": [{
+            "task": state["task_name"],
+            "error": str(e)
+        }]}
+
+def aggregate_with_partial_failure(state: State) -> dict:
+    """聚合时处理部分失败"""
+    total = len(state["successes"]) + len(state["failures"])
+    success_rate = len(state["successes"]) / total
+
+    if success_rate >= 0.7:  # 70%成功就继续
+        return {"status": "partial_success", "data": state["successes"]}
+    else:
+        return {"status": "failed", "errors": state["failures"]}
+```
+
+**策略2:重试机制**
+
+```python
+def task_with_retry(state: TaskState) -> dict:
+    """失败自动重试"""
+    max_retries = 3
+    attempt = state.get("attempt", 0)
+
+    try:
+        result = execute(state["data"])
+        return {"results": [result]}
+    except Exception as e:
+        if attempt < max_retries:
+            # 重新发送任务,增加重试计数
+            return Send("task_with_retry", {
+                **state,
+                "attempt": attempt + 1
+            })
+        else:
+            # 达到最大重试次数,记录失败
+            return {"failures": [{"error": str(e)}]}
+```
+
+**策略3:降级处理**
+
+```python
+def task_with_fallback(state: TaskState) -> dict:
+    """主任务失败时使用备选方案"""
+    try:
+        # 尝试首选方法
+        result = preferred_method(state["data"])
+        return {"results": [result]}
+    except Exception:
+        try:
+            # 降级到备选方法
+            result = fallback_method(state["data"])
+            return {"results": [result], "used_fallback": True}
+        except Exception as e:
+            # 两种方法都失败
+            return {"failures": [{"error": str(e)}]}
+```
+
+**小结**
+
+并行执行的最佳实践:
+- ✅ 只并行独立的任务
+- ✅ 使用 Send API 实现动态并行
+- ✅ 控制并发数量,避免资源耗尽
+- ✅ 处理部分失败,保证健壮性
+- ✅ 使用 reducer 自动聚合结果
+
+并行执行是提升 Agent 性能的关键,合理使用能显著减少总执行时间。
+
+---
