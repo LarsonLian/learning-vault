@@ -1639,3 +1639,550 @@ class State(TypedDict):
 状态是 Agent 的记忆,设计得当能让 Agent 更智能、更可靠。
 
 ---
+
+### 第 6 章:条件路由 - 让 Agent 做决策
+
+条件路由(Conditional Routing)是 LangGraph 实现动态控制流的核心机制。通过条件边,Agent 可以根据状态动态选择下一步行动,实现真正的智能决策。
+
+#### 6.1 概念讲解
+
+##### 6.1.1 条件边原理
+
+**普通边 vs 条件边**
+
+```python
+# 普通边:固定路径
+graph.add_edge("node_a", "node_b")
+# node_a 总是执行 node_b
+
+# 条件边:动态路径
+graph.add_conditional_edges(
+    "node_a",           # 源节点
+    routing_function,   # 路由函数
+    {                   # 路由映射
+        "path1": "node_b",
+        "path2": "node_c",
+        "path3": "node_d"
+    }
+)
+# node_a 根据routing_function的返回值选择下一个节点
+```
+
+**工作机制**
+
+```
+1. node_a 执行完成 → 产生新状态
+2. LangGraph 调用 routing_function(新状态)
+3. routing_function 返回字符串(如 "path1")
+4. LangGraph 查找映射表 {"path1": "node_b"}
+5. 执行 node_b
+```
+
+**可视化**
+
+```
+node_a → [routing_function决策] →
+    ├─ "path1" → node_b
+    ├─ "path2" → node_c
+    └─ "path3" → node_d
+```
+
+##### 6.1.2 路由函数详解
+
+路由函数的标准签名:
+
+```python
+def routing_function(state: StateType) -> str:
+    """
+    输入: 当前完整状态
+    输出: 下一个节点的名称(字符串)
+    """
+    # 基于状态做决策
+    if condition1(state):
+        return "node_name_1"
+    elif condition2(state):
+        return "node_name_2"
+    else:
+        return "node_name_3"
+```
+
+**路由函数的三种模式**
+
+**模式1:基于状态字段**
+
+```python
+def route_by_status(state: State) -> str:
+    """根据状态字段路由"""
+    status = state["task_status"]
+
+    if status == "simple":
+        return "auto_handler"
+    elif status == "complex":
+        return "manual_review"
+    else:
+        return "error_handler"
+```
+
+**模式2:基于计算逻辑**
+
+```python
+def route_by_score(state: State) -> str:
+    """根据计算结果路由"""
+    score = calculate_confidence(state["data"])
+
+    if score > 0.9:
+        return "high_confidence"
+    elif score > 0.6:
+        return "medium_confidence"
+    else:
+        return "low_confidence"
+```
+
+**模式3:基于 LLM 决策**
+
+```python
+def route_by_llm(state: State) -> str:
+    """让 LLM 决定路由"""
+    prompt = f"""
+    根据以下信息,决定下一步操作:
+    {state["context"]}
+
+    回复以下之一:
+    - "need_more_info"
+    - "ready_to_execute"
+    - "escalate_to_human"
+    """
+
+    decision = llm.invoke(prompt)
+    return decision.strip()
+```
+
+##### 6.1.3 END 节点和图终止
+
+**END 的作用**
+
+```python
+from langgraph.graph import END
+
+# END 是特殊的终止节点
+graph.add_edge("final_node", END)
+# 执行到此,图结束,返回最终状态
+```
+
+**使用 END 的三种方式**
+
+**方式1:普通边指向 END**
+
+```python
+graph.add_edge("conclude", END)
+# conclude 执行后,图终止
+```
+
+**方式2:条件边指向 END**
+
+```python
+def should_continue(state: State) -> str:
+    if state["is_done"]:
+        return "END"
+    else:
+        return "continue_processing"
+
+graph.add_conditional_edges(
+    "check_completion",
+    should_continue,
+    {
+        "END": END,
+        "continue_processing": "next_step"
+    }
+)
+```
+
+**方式3:路由函数直接返回 END**
+
+```python
+from langgraph.graph import END
+
+def smart_router(state: State) -> str | END:
+    if all_done(state):
+        return END  # 直接返回 END 对象
+    else:
+        return "next_node"
+```
+
+#### 6.2 实战片段:任务分类路由器
+
+让我们实现一个完整的任务分类系统:
+
+```python
+from typing import Literal
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+# 状态定义
+class TaskState(TypedDict):
+    task_description: str
+    task_complexity: Literal["simple", "medium", "complex"] | None
+    estimated_hours: int | None
+    requires_approval: bool
+    result: str | None
+
+# 节点1:分析任务复杂度
+def analyze_complexity(state: TaskState) -> dict:
+    """分析任务复杂度"""
+    description = state["task_description"]
+
+    # 简化的复杂度分析(实际会用 LLM)
+    word_count = len(description.split())
+
+    if word_count < 10:
+        complexity = "simple"
+        hours = 2
+        approval = False
+    elif word_count < 30:
+        complexity = "medium"
+        hours = 8
+        approval = False
+    else:
+        complexity = "complex"
+        hours = 40
+        approval = True
+
+    return {
+        "task_complexity": complexity,
+        "estimated_hours": hours,
+        "requires_approval": approval
+    }
+
+# 路由函数:根据复杂度路由
+def route_by_complexity(state: TaskState) -> str:
+    """根据任务复杂度决定下一步"""
+    complexity = state["task_complexity"]
+
+    if complexity == "simple":
+        return "auto_execute"
+    elif complexity == "medium":
+        return "assign_to_team"
+    else:  # complex
+        if state["requires_approval"]:
+            return "request_approval"
+        else:
+            return "decompose_task"
+
+# 节点2a:自动执行简单任务
+def auto_execute(state: TaskState) -> dict:
+    """直接执行简单任务"""
+    result = f"自动执行: {state['task_description']}"
+    return {"result": result}
+
+# 节点2b:分配中等任务
+def assign_to_team(state: TaskState) -> dict:
+    """分配给团队"""
+    result = f"已分配给团队,预计{state['estimated_hours']}小时"
+    return {"result": result}
+
+# 节点2c:请求审批
+def request_approval(state: TaskState) -> dict:
+    """请求审批"""
+    result = f"等待审批:复杂任务,预计{state['estimated_hours']}小时"
+    return {"result": result}
+
+# 节点2d:分解任务
+def decompose_task(state: TaskState) -> dict:
+    """分解复杂任务"""
+    result = f"任务已分解为子任务"
+    return {"result": result}
+
+# 构建图
+builder = StateGraph(TaskState)
+
+# 添加节点
+builder.add_node("analyze", analyze_complexity)
+builder.add_node("auto_execute", auto_execute)
+builder.add_node("assign_to_team", assign_to_team)
+builder.add_node("request_approval", request_approval)
+builder.add_node("decompose_task", decompose_task)
+
+# 添加边
+builder.add_edge(START, "analyze")
+
+# 添加条件边:核心路由逻辑
+builder.add_conditional_edges(
+    "analyze",              # 源节点
+    route_by_complexity,    # 路由函数
+    {                       # 路由映射
+        "auto_execute": "auto_execute",
+        "assign_to_team": "assign_to_team",
+        "request_approval": "request_approval",
+        "decompose_task": "decompose_task"
+    }
+)
+
+# 所有处理节点都指向 END
+builder.add_edge("auto_execute", END)
+builder.add_edge("assign_to_team", END)
+builder.add_edge("request_approval", END)
+builder.add_edge("decompose_task", END)
+
+# 编译
+graph = builder.compile()
+
+# 测试不同复杂度的任务
+tasks = [
+    "修复bug",                                  # 简单
+    "优化数据库查询性能",                       # 中等
+    "重构整个用户认证系统,支持多种登录方式"    # 复杂
+]
+
+for task in tasks:
+    result = graph.invoke({
+        "task_description": task,
+        "task_complexity": None,
+        "estimated_hours": None,
+        "requires_approval": False,
+        "result": None
+    })
+    print(f"\n任务: {task}")
+    print(f"复杂度: {result['task_complexity']}")
+    print(f"处理: {result['result']}")
+```
+
+**执行流程示例**
+
+```
+输入: "修复bug"
+↓
+analyze (分析) → complexity="simple", hours=2
+↓
+route_by_complexity (路由) → 返回 "auto_execute"
+↓
+auto_execute (执行) → result="自动执行: 修复bug"
+↓
+END
+
+最终状态:
+{
+  "task_description": "修复bug",
+  "task_complexity": "simple",
+  "estimated_hours": 2,
+  "requires_approval": false,
+  "result": "自动执行: 修复bug"
+}
+```
+
+#### 6.3 最佳实践
+
+##### 6.3.1 路由逻辑应该简单明确
+
+**原则**: 路由函数应该易于理解,决策清晰
+
+**反例:复杂的嵌套逻辑**
+
+```python
+# ❌ 不好:逻辑复杂,难以维护
+def complex_router(state: State) -> str:
+    if state["type"] == "A":
+        if state["score"] > 0.8:
+            if state["user_level"] == "premium":
+                return "path1"
+            else:
+                return "path2" if state["count"] > 5 else "path3"
+        else:
+            return "path4"
+    elif state["type"] == "B":
+        # ... 更多嵌套
+```
+
+**正例:清晰的决策树**
+
+```python
+# ✅ 好:逻辑清晰,每个分支明确
+def clear_router(state: State) -> str:
+    # 先检查类型
+    if state["type"] == "urgent":
+        return "urgent_handler"
+
+    # 再检查分数
+    if state["score"] > 0.8:
+        return "high_score_path"
+
+    # 最后的默认路径
+    return "standard_path"
+```
+
+**更好:提取决策逻辑**
+
+```python
+# ✅ 最好:决策逻辑独立,易于测试
+def calculate_priority(state: State) -> str:
+    """计算优先级(纯函数,易测试)"""
+    if state["is_urgent"]:
+        return "high"
+    elif state["score"] > 0.8:
+        return "medium"
+    else:
+        return "low"
+
+def route_by_priority(state: State) -> str:
+    """路由函数简单调用决策逻辑"""
+    priority = calculate_priority(state)
+
+    priority_map = {
+        "high": "urgent_handler",
+        "medium": "normal_handler",
+        "low": "batch_handler"
+    }
+
+    return priority_map[priority]
+```
+
+##### 6.3.2 处理所有可能的分支
+
+**原则**: 确保路由函数覆盖所有可能的状态,避免死路径
+
+**反例:遗漏分支**
+
+```python
+# ❌ 危险:如果 status 不是这三个值之一,会出错
+def incomplete_router(state: State) -> str:
+    if state["status"] == "ready":
+        return "execute"
+    elif state["status"] == "pending":
+        return "wait"
+    elif state["status"] == "failed":
+        return "retry"
+    # 缺少 else 分支!
+```
+
+**正例:总是有默认分支**
+
+```python
+# ✅ 安全:总是有 fallback
+def complete_router(state: State) -> str:
+    status = state["status"]
+
+    if status == "ready":
+        return "execute"
+    elif status == "pending":
+        return "wait"
+    elif status == "failed":
+        return "retry"
+    else:
+        # 默认分支:记录未知状态并终止
+        log_warning(f"Unknown status: {status}")
+        return END
+```
+
+**更好:使用枚举和完全匹配**
+
+```python
+from typing import Literal
+
+# ✅ 最好:类型系统保证完整性
+def type_safe_router(state: State) -> str:
+    status: Literal["ready", "pending", "failed", "unknown"] = state["status"]
+
+    match status:
+        case "ready":
+            return "execute"
+        case "pending":
+            return "wait"
+        case "failed":
+            return "retry"
+        case "unknown":
+            return END
+```
+
+**测试路由完整性**
+
+```python
+# 单元测试:确保所有状态都有路由
+def test_router_completeness():
+    test_cases = [
+        ({"status": "ready"}, "execute"),
+        ({"status": "pending"}, "wait"),
+        ({"status": "failed"}, "retry"),
+        ({"status": "invalid"}, END),  # 测试边界情况
+    ]
+
+    for state, expected in test_cases:
+        result = complete_router(state)
+        assert result == expected
+```
+
+##### 6.3.3 使用枚举避免字符串硬编码
+
+**原则**: 使用常量或枚举定义节点名称,避免拼写错误
+
+**反例:字符串硬编码**
+
+```python
+# ❌ 危险:容易拼写错误
+def bad_router(state: State) -> str:
+    if state["score"] > 0.8:
+        return "high_priority_handler"  # 这里拼写正确吗?
+
+builder.add_node("high_pririty_handler", handler)  # 拼写错误!
+# 运行时才会发现错误
+```
+
+**正例:使用常量**
+
+```python
+# ✅ 好:使用常量
+class NodeNames:
+    HIGH_PRIORITY = "high_priority_handler"
+    MEDIUM_PRIORITY = "medium_priority_handler"
+    LOW_PRIORITY = "low_priority_handler"
+
+def good_router(state: State) -> str:
+    if state["score"] > 0.8:
+        return NodeNames.HIGH_PRIORITY  # IDE会自动补全
+
+builder.add_node(NodeNames.HIGH_PRIORITY, handler)  # 一致性保证
+```
+
+**更好:使用枚举**
+
+```python
+# ✅ 最好:使用枚举
+from enum import Enum
+
+class NodeName(str, Enum):
+    HIGH_PRIORITY = "high_priority_handler"
+    MEDIUM_PRIORITY = "medium_priority_handler"
+    LOW_PRIORITY = "low_priority_handler"
+
+def best_router(state: State) -> NodeName:
+    """类型安全的路由函数"""
+    if state["score"] > 0.8:
+        return NodeName.HIGH_PRIORITY  # 类型安全
+    elif state["score"] > 0.5:
+        return NodeName.MEDIUM_PRIORITY
+    else:
+        return NodeName.LOW_PRIORITY
+
+# 构建图时也使用枚举
+builder.add_node(NodeName.HIGH_PRIORITY, high_priority_handler)
+builder.add_conditional_edges(
+    "analyze",
+    best_router,
+    {
+        NodeName.HIGH_PRIORITY: NodeName.HIGH_PRIORITY.value,
+        NodeName.MEDIUM_PRIORITY: NodeName.MEDIUM_PRIORITY.value,
+        NodeName.LOW_PRIORITY: NodeName.LOW_PRIORITY.value,
+    }
+)
+```
+
+**小结**
+
+条件路由的最佳实践:
+- ✅ 保持路由逻辑简单明确
+- ✅ 覆盖所有可能的分支,总是有 else
+- ✅ 使用枚举或常量,避免字符串硬编码
+- ✅ 独立测试路由函数
+- ✅ 考虑边界情况和异常状态
+
+条件路由让 Agent 能够智能决策,是实现复杂工作流的关键。
+
+---
