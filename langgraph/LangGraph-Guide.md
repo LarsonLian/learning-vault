@@ -2750,3 +2750,592 @@ def task_with_fallback(state: TaskState) -> dict:
 并行执行是提升 Agent 性能的关键,合理使用能显著减少总执行时间。
 
 ---
+
+### 第 8 章:人机协作 - Interrupt 与 Approval 模式
+
+人机协作(Human-in-the-Loop)是 AI Agent 的重要能力。LangGraph 通过 `interrupt` 机制,让 Agent 能够在关键点暂停,等待人类输入后继续执行。
+
+#### 8.1 概念讲解
+
+##### 8.1.1 Interrupt 机制详解
+
+**什么是 Interrupt**
+
+Interrupt 允许图在执行过程中**暂停**,等待外部输入(通常是人类),然后**恢复**执行。
+
+```
+正常执行流程:
+node_a → node_b → node_c → END
+
+带 Interrupt 的流程:
+node_a → node_b → [暂停,等待输入] → node_c → END
+                  ↑
+                  人类提供输入
+```
+
+**Interrupt 的两种方式**
+
+**方式1:编译时配置(静态)**
+
+```python
+graph = graph_builder.compile(
+    checkpointer=checkpointer,           # 必须有 checkpointer
+    interrupt_before=["risky_operation"], # 在该节点执行前中断
+    # 或
+    interrupt_after=["data_collection"]   # 在该节点执行后中断
+)
+```
+
+**方式2:运行时调用(动态)**
+
+```python
+from langgraph.types import interrupt
+
+def approval_node(state: State) -> dict:
+    """节点内部调用 interrupt"""
+    # 暂停并等待用户输入
+    user_decision = interrupt({
+        "action": state["pending_action"],
+        "question": "是否批准此操作?"
+    })
+
+    # user_decision 是用户提供的值
+    return {"approved": user_decision}
+```
+
+**工作机制**
+
+```
+1. 图执行到 interrupt 点
+2. LangGraph 保存当前状态到 checkpointer
+3. 图暂停,返回中断信息
+4. 用户审查并提供输入
+5. 用户调用 graph.invoke(Command(resume=user_input), config)
+6. 图从中断点恢复执行,使用用户输入
+```
+
+##### 8.1.2 Approval 工作流模式
+
+**基本审批模式**
+
+```python
+def prepare_action(state: State) -> dict:
+    """准备要执行的操作"""
+    action = generate_action_plan(state)
+    return {"pending_action": action}
+
+def request_approval(state: State) -> dict:
+    """请求人工审批"""
+    approved = interrupt({
+        "action": state["pending_action"],
+        "context": state["current_context"],
+        "prompt": "请审批此操作"
+    })
+
+    return {"approved": approved}
+
+def execute_or_cancel(state: State) -> dict:
+    """根据审批结果执行或取消"""
+    if state["approved"]:
+        result = execute(state["pending_action"])
+        return {"result": result, "status": "executed"}
+    else:
+        return {"result": None, "status": "cancelled"}
+```
+
+**多级审批模式**
+
+```python
+def route_by_risk(state: State) -> str:
+    """根据风险等级路由"""
+    risk = assess_risk(state["action"])
+
+    if risk == "low":
+        return "auto_execute"  # 低风险,自动执行
+    elif risk == "medium":
+        return "manager_approval"  # 中风险,经理审批
+    else:
+        return "director_approval"  # 高风险,总监审批
+
+# 图结构
+#   prepare → assess_risk → [条件路由]
+#     ├─ low → auto_execute
+#     ├─ medium → manager_approval → execute
+#     └─ high → director_approval → execute
+```
+
+##### 8.1.3 恢复执行的状态管理
+
+**Checkpointer 的作用**
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+# Interrupt 必须配合 checkpointer 使用
+checkpointer = InMemorySaver()
+graph = builder.compile(checkpointer=checkpointer)
+
+# 每次执行需要提供 thread_id
+config = {"configurable": {"thread_id": "user_123"}}
+
+# 第一次执行:运行到 interrupt
+result1 = graph.invoke(initial_state, config=config)
+# result1["__interrupt__"] 包含中断信息
+
+# 恢复执行:提供用户输入
+from langgraph.types import Command
+result2 = graph.invoke(Command(resume=user_input), config=config)
+# 从中断点继续,使用 user_input
+```
+
+**状态完整性**
+
+Interrupt 前后,状态完全保留:
+
+```python
+# Interrupt 前的状态
+{
+  "messages": ["用户消息1", "AI回复1"],
+  "current_task": "数据分析",
+  "progress": 0.5
+}
+
+# 暂停...
+
+# Interrupt 后恢复,状态完整保留
+# 加上用户提供的新输入
+{
+  "messages": ["用户消息1", "AI回复1"],
+  "current_task": "数据分析",
+  "progress": 0.5,
+  "user_feedback": "继续"  # 新添加
+}
+```
+
+#### 8.2 实战片段:高风险操作审批流程
+
+让我们构建一个完整的审批工作流:
+
+```python
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import InMemorySaver
+
+# 状态定义
+class ApprovalState(TypedDict):
+    action_type: str                 # 操作类型
+    action_details: dict              # 操作详情
+    risk_level: Literal["low", "medium", "high"] | None
+    requires_approval: bool
+    approval_status: Literal["pending", "approved", "rejected"] | None
+    execution_result: str | None
+
+# 节点1:准备操作
+def prepare_action(state: ApprovalState) -> dict:
+    """分析并准备操作"""
+    action_type = state["action_type"]
+    details = state["action_details"]
+
+    print(f"准备操作: {action_type}")
+    print(f"详情: {details}")
+
+    return {}  # 状态已包含操作信息
+
+# 节点2:评估风险
+def assess_risk(state: ApprovalState) -> dict:
+    """评估操作风险"""
+    action_type = state["action_type"]
+
+    # 简化的风险评估
+    risk_levels = {
+        "read_data": "low",
+        "update_data": "medium",
+        "delete_data": "high",
+        "system_config": "high"
+    }
+
+    risk = risk_levels.get(action_type, "medium")
+    requires_approval = (risk in ["medium", "high"])
+
+    print(f"风险等级: {risk}")
+    print(f"需要审批: {requires_approval}")
+
+    return {
+        "risk_level": risk,
+        "requires_approval": requires_approval
+    }
+
+# 路由函数:决定是否需要审批
+def route_by_approval(state: ApprovalState) -> str:
+    """根据风险决定路由"""
+    if not state["requires_approval"]:
+        return "auto_execute"
+    else:
+        return "request_approval"
+
+# 节点3a:自动执行(低风险)
+def auto_execute(state: ApprovalState) -> dict:
+    """自动执行低风险操作"""
+    result = f"已自动执行: {state['action_type']}"
+    print(result)
+
+    return {
+        "approval_status": "approved",
+        "execution_result": result
+    }
+
+# 节点3b:请求审批(高/中风险)
+def request_approval(state: ApprovalState) -> dict:
+    """暂停并请求人工审批"""
+    print("\n" + "="*50)
+    print("⚠️  需要人工审批")
+    print("="*50)
+
+    # 构造审批请求
+    approval_request = {
+        "action": state["action_type"],
+        "details": state["action_details"],
+        "risk": state["risk_level"],
+        "question": "是否批准此操作?(输入 'yes' 或 'no')"
+    }
+
+    # 调用 interrupt,暂停执行
+    user_decision = interrupt(approval_request)
+
+    # 图会在这里暂停,等待用户输入
+    # 用户调用 resume 后,user_decision 会是用户提供的值
+
+    # 解析用户决策
+    approved = (user_decision == "yes")
+
+    return {
+        "approval_status": "approved" if approved else "rejected"
+    }
+
+# 节点4:执行或取消
+def execute_or_cancel(state: ApprovalState) -> dict:
+    """根据审批结果执行或取消"""
+    if state["approval_status"] == "approved":
+        result = f"✓ 已执行: {state['action_type']}"
+        print(result)
+        return {"execution_result": result}
+    else:
+        result = f"✗ 已取消: {state['action_type']}"
+        print(result)
+        return {"execution_result": result}
+
+# 构建图
+builder = StateGraph(ApprovalState)
+
+# 添加节点
+builder.add_node("prepare", prepare_action)
+builder.add_node("assess", assess_risk)
+builder.add_node("auto_execute", auto_execute)
+builder.add_node("request_approval", request_approval)
+builder.add_node("execute_or_cancel", execute_or_cancel)
+
+# 添加边
+builder.add_edge(START, "prepare")
+builder.add_edge("prepare", "assess")
+
+# 条件路由:根据风险决定是否需要审批
+builder.add_conditional_edges(
+    "assess",
+    route_by_approval,
+    {
+        "auto_execute": "auto_execute",
+        "request_approval": "request_approval"
+    }
+)
+
+# 自动执行直接结束
+builder.add_edge("auto_execute", END)
+
+# 审批后执行或取消
+builder.add_edge("request_approval", "execute_or_cancel")
+builder.add_edge("execute_or_cancel", END)
+
+# 编译(必须使用 checkpointer)
+checkpointer = InMemorySaver()
+graph = builder.compile(checkpointer=checkpointer)
+
+# ========== 测试场景1:低风险操作(自动执行) ==========
+print("\n【场景1:低风险操作 - 读取数据】")
+config1 = {"configurable": {"thread_id": "request_001"}}
+
+result1 = graph.invoke({
+    "action_type": "read_data",
+    "action_details": {"table": "users", "limit": 10},
+    "risk_level": None,
+    "requires_approval": False,
+    "approval_status": None,
+    "execution_result": None
+}, config=config1)
+
+print(f"最终结果: {result1['execution_result']}\n")
+
+# ========== 测试场景2:高风险操作(需要审批) ==========
+print("\n【场景2:高风险操作 - 删除数据】")
+config2 = {"configurable": {"thread_id": "request_002"}}
+
+# 第一步:执行到 interrupt
+result2_step1 = graph.invoke({
+    "action_type": "delete_data",
+    "action_details": {"table": "orders", "condition": "status='cancelled'"},
+    "risk_level": None,
+    "requires_approval": False,
+    "approval_status": None,
+    "execution_result": None
+}, config=config2)
+
+# 检查是否中断
+if "__interrupt__" in result2_step1:
+    print("\n图已暂停,等待审批...")
+    print(f"中断信息: {result2_step1['__interrupt__']}")
+
+    # 第二步:用户审批(模拟用户批准)
+    print("\n用户决策: 批准")
+    result2_step2 = graph.invoke(
+        Command(resume="yes"),  # 用户批准
+        config=config2
+    )
+
+    print(f"最终结果: {result2_step2['execution_result']}")
+
+# ========== 测试场景3:拒绝审批 ==========
+print("\n【场景3:高风险操作 - 拒绝审批】")
+config3 = {"configurable": {"thread_id": "request_003"}}
+
+result3_step1 = graph.invoke({
+    "action_type": "system_config",
+    "action_details": {"setting": "max_connections", "value": 1000},
+    "risk_level": None,
+    "requires_approval": False,
+    "approval_status": None,
+    "execution_result": None
+}, config=config3)
+
+if "__interrupt__" in result3_step1:
+    print("\n用户决策: 拒绝")
+    result3_step2 = graph.invoke(
+        Command(resume="no"),  # 用户拒绝
+        config=config3
+    )
+
+    print(f"最终结果: {result3_step2['execution_result']}")
+```
+
+**执行流程示例**
+
+```
+场景2:删除数据(高风险)
+
+START
+  ↓
+prepare (准备操作) → action_type="delete_data"
+  ↓
+assess (评估风险) → risk="high", requires_approval=true
+  ↓
+route_by_approval → 返回 "request_approval"
+  ↓
+request_approval → interrupt(审批请求)
+  ↓
+[图暂停,保存状态]
+  ↓
+[用户审查,决定批准/拒绝]
+  ↓
+graph.invoke(Command(resume="yes")) → 恢复执行
+  ↓
+execute_or_cancel → approval_status="approved" → 执行
+  ↓
+END
+```
+
+#### 8.3 最佳实践
+
+##### 8.3.1 何时需要人类介入
+
+**原则**:在不确定性高、影响大的决策点使用人机协作
+
+**适合人工介入的场景**
+
+| 场景类型 | 示例 | 原因 |
+|---------|------|------|
+| **高风险操作** | 删除数据、修改配置、发送邮件 | 错误代价高 |
+| **低置信度决策** | LLM 置信度 < 0.7 的结果 | 结果不可靠 |
+| **创意性工作** | 设计方案、营销文案 | 需要人类审美 |
+| **伦理敏感** | 涉及隐私、法律的决策 | 需要人类判断 |
+| **异常情况** | 遇到训练数据外的情况 | Agent 无法处理 |
+| **学习反馈** | 收集人类偏好用于改进 | 持续优化 |
+
+**不适合人工介入的场景**
+
+```python
+# ❌ 不要在这些情况下使用 interrupt
+- 简单的数据查询
+- 确定性的计算
+- 已经过充分测试的操作
+- 高频率的重复任务
+```
+
+**动态决策示例**
+
+```python
+def smart_interrupt(state: State) -> dict:
+    """根据置信度决定是否中断"""
+    confidence = state["llm_confidence"]
+
+    if confidence < 0.6:
+        # 置信度低,请求人工确认
+        user_input = interrupt({
+            "suggestion": state["llm_output"],
+            "confidence": confidence,
+            "question": "LLM 不确定,请人工确认"
+        })
+        return {"final_output": user_input}
+    else:
+        # 置信度高,直接使用 LLM 输出
+        return {"final_output": state["llm_output"]}
+```
+
+##### 8.3.2 超时处理机制
+
+**原则**:人工审批不应无限期等待
+
+**策略1:在应用层实现超时**
+
+```python
+import time
+from datetime import datetime, timedelta
+
+def request_approval_with_timeout(state: State) -> dict:
+    """带超时的审批请求"""
+    # 记录请求时间
+    request_time = datetime.now()
+
+    # 请求审批
+    decision = interrupt({
+        "action": state["action"],
+        "timeout": "2小时",
+        "default": "auto_reject"
+    })
+
+    # 注意:interrupt 会暂停图
+    # 恢复后,检查是否超时(在外部应用逻辑中实现)
+
+    return {"approval": decision}
+
+# 在应用层
+def monitor_approval(thread_id, timeout_hours=2):
+    """监控审批超时"""
+    deadline = datetime.now() + timedelta(hours=timeout_hours)
+
+    while datetime.now() < deadline:
+        # 检查是否有用户输入
+        if check_user_response(thread_id):
+            return "approved"
+        time.sleep(60)  # 每分钟检查一次
+
+    # 超时,自动拒绝
+    graph.invoke(Command(resume="timeout_reject"), config)
+```
+
+**策略2:在状态中记录时间**
+
+```python
+class State(TypedDict):
+    approval_requested_at: str | None
+    approval_deadline: str | None
+
+def check_timeout(state: State) -> str:
+    """检查是否超时"""
+    if state["approval_deadline"]:
+        deadline = datetime.fromisoformat(state["approval_deadline"])
+        if datetime.now() > deadline:
+            return "timeout_handler"
+
+    return "wait_approval"
+```
+
+##### 8.3.3 审批上下文的完整性
+
+**原则**:提供足够的上下文,让人类做出明智决策
+
+**反例:上下文不足**
+
+```python
+# ❌ 不好:信息不足
+approved = interrupt({
+    "question": "是否批准?"  # 批准什么?
+})
+```
+
+**正例:完整上下文**
+
+```python
+# ✅ 好:提供完整信息
+approved = interrupt({
+    # 1. 操作描述
+    "action": {
+        "type": "delete_records",
+        "table": "users",
+        "condition": "last_login < '2020-01-01'",
+        "estimated_affected": 15234
+    },
+
+    # 2. 风险评估
+    "risk": {
+        "level": "high",
+        "concerns": ["不可逆操作", "影响大量数据"],
+        "mitigation": "已备份到 backup_users 表"
+    },
+
+    # 3. 上下文信息
+    "context": {
+        "requester": "admin@example.com",
+        "reason": "清理过期数据",
+        "timestamp": "2024-03-15 10:30:00"
+    },
+
+    # 4. 明确的问题
+    "question": "是否批准删除 15234 条用户记录?",
+
+    # 5. 预期的回复格式
+    "expected_response": "yes/no/defer"
+})
+```
+
+**提供撤销选项**
+
+```python
+def execute_with_undo(state: State) -> dict:
+    """执行操作,但提供撤销机会"""
+    # 执行操作
+    result = execute(state["action"])
+
+    # 再次中断,提供撤销机会
+    confirm = interrupt({
+        "result": result,
+        "question": "操作已执行,是否确认?输入 'undo' 撤销"
+    })
+
+    if confirm == "undo":
+        rollback(result)
+        return {"status": "reverted"}
+    else:
+        return {"status": "confirmed", "result": result}
+```
+
+**小结**
+
+人机协作的最佳实践:
+- ✅ 在高风险、不确定的决策点使用
+- ✅ 提供完整的上下文信息
+- ✅ 实现超时和默认行为
+- ✅ 必须使用 checkpointer 保存状态
+- ✅ 考虑撤销和回滚机制
+
+人机协作让 Agent 更可控、更可信,是生产环境的必备能力。
+
+---
